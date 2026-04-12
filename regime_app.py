@@ -3,7 +3,7 @@ import statistics
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# Page config
 
 st.set_page_config(
 page_title=“V10 Regime Check”,
@@ -12,21 +12,17 @@ layout=“centered”,
 initial_sidebar_state=“collapsed”,
 )
 
-# ── Styling ───────────────────────────────────────────────────────────────────
+# Styling
 
 st.markdown(”””
 
 <style>
-    /* Mobile-first dark theme */
     .stApp { background-color: #0a0a0f; }
     .block-container { padding: 1rem 1rem 2rem; max-width: 480px; }
-
     h1 { color: #f1f5f9 !important; font-size: 1.4rem !important; }
     h2 { font-size: 1rem !important; color: #94a3b8 !important;
          letter-spacing: 0.1em; text-transform: uppercase; }
     p, li { color: #cbd5e1; font-size: 0.9rem; }
-
-    /* Cards */
     .regime-card {
         border-radius: 14px; padding: 18px; margin-bottom: 12px;
         border: 2px solid; font-family: monospace;
@@ -44,23 +40,18 @@ st.markdown(”””
         border-radius: 8px; padding: 10px 12px; margin-bottom: 6px;
         color: #94a3b8; font-size: 0.85rem;
     }
-    .alert-box {
-        border-radius: 10px; padding: 12px 14px; margin-bottom: 8px;
-        border-left: 4px solid; font-size: 0.85rem;
-    }
     .stButton > button {
-        width: 100%; background: linear-gradient(135deg, #2563eb, #4f46e5);
+        width: 100%;
+        background: linear-gradient(135deg, #2563eb, #4f46e5);
         color: white; border: none; border-radius: 12px;
         padding: 14px; font-size: 1rem; font-weight: 700;
         cursor: pointer; margin-bottom: 8px;
     }
-    .stButton > button:hover { opacity: 0.9; }
-    div[data-testid="stStatusWidget"] { display: none; }
 </style>
 
 “””, unsafe_allow_html=True)
 
-# ── V10 Calculations ──────────────────────────────────────────────────────────
+# V10 Calculations
 
 def calc_sma(prices, period):
 if len(prices) < period:
@@ -95,77 +86,75 @@ if vix < 20:
 return “TREND”, pct
 return “TENSION”, pct
 
-# ── Regime config ─────────────────────────────────────────────────────────────
-
 REGIMES = {
 “TREND”: {
 “color”: “#16a34a”, “bg”: “#052e16”, “border”: “#166534”,
-“icon”: “▲”,
-“contracts”: “6 contracts”, “dte”: “7 DTE”, “delta”: “Δ 0.20–0.30”,
+“icon”: “UP”,
+“contracts”: “6 contracts”, “dte”: “7 DTE”, “delta”: “0.20-0.30”,
 “instrument”: “TQQQ cash-secured puts”,
 “action”: “Full CSP engine active. Set GTC profit-take at 50% immediately after fill.”,
 “checks”: [
 “Check % stocks above 200MA (StockCharts $NAA200R)”,
-“> 55% → full 6 contracts”,
-“40–55% → reduce to 4 contracts (Tension sizing)”,
-“< 40% → reduce to 4 contracts”,
+“> 55% = full 6 contracts”,
+“40-55% = reduce to 4 contracts (Tension sizing)”,
+“< 40% = reduce to 4 contracts”,
 ],
 },
 “TENSION”: {
 “color”: “#d97706”, “bg”: “#1c1000”, “border”: “#92400e”,
-“icon”: “◆”,
-“contracts”: “4 contracts”, “dte”: “14–21 DTE”, “delta”: “Δ 0.15–0.20”,
+“icon”: “~~”,
+“contracts”: “4 contracts”, “dte”: “14-21 DTE”, “delta”: “0.15-0.20”,
 “instrument”: “TQQQ cash-secured puts (further OTM)”,
-“action”: “Reduced engine. Wider DTE for buffer. Monitor 200MA daily for regime change.”,
+“action”: “Reduced engine. Wider DTE for buffer. Monitor 200MA daily.”,
 “checks”: [
 “Watch for QQQ reclaiming or losing 200MA”,
-“VIX rising toward 28+ → reduce to 2 contracts”,
+“VIX rising toward 28+ = reduce to 2 contracts”,
 ],
 },
 “NO MAN’S LAND”: {
 “color”: “#d97706”, “bg”: “#1c1000”, “border”: “#92400e”,
-“icon”: “◇”,
-“contracts”: “0 — unless filter passes”, “dte”: “7–10 DTE”, “delta”: “Δ 0.20–0.30”,
+“icon”: “??”,
+“contracts”: “0 unless filter passes”, “dte”: “7-10 DTE”, “delta”: “0.20-0.30”,
 “instrument”: “SPXS or SQQQ credit spreads only”,
-“action”: “DO NOT TRADE unless spread credit ≥ 25% of width. Median 2-day cluster.”,
+“action”: “DO NOT TRADE unless spread credit >= 25% of width. Median 2-day cluster.”,
 “checks”: [
 “Run credit filter before any entry”,
-“Net credit ≥ 25% of spread width required”,
+“Net credit >= 25% of spread width required”,
 “If no spread passes the filter: stay cash”,
 ],
 },
 “STRESS”: {
 “color”: “#dc2626”, “bg”: “#1a0000”, “border”: “#7f1d1d”,
-“icon”: “▼”,
-“contracts”: “0 new TQQQ CSPs”, “dte”: “7–10 DTE”, “delta”: “Δ 0.20–0.30”,
+“icon”: “DN”,
+“contracts”: “0 new TQQQ CSPs”, “dte”: “7-10 DTE”, “delta”: “0.20-0.30”,
 “instrument”: “SPXS spreads (preferred) / SQQQ credit spreads”,
 “action”: “Inverse spread engine. No new TQQQ positions.”,
 “checks”: [
-“Credit filter: net credit ≥ 25% of width”,
-“Short leg ≥ 5% OTM from current SPXS/SQQQ price”,
+“Credit filter: net credit >= 25% of width”,
+“Short leg >= 5% OTM from current SPXS/SQQQ price”,
 “Max collateral per spread: 15% of NLV”,
 “SQQQ valid for spreads at any account size”,
 ],
 },
 “CAPITULATION”: {
 “color”: “#7c3aed”, “bg”: “#0d0520”, “border”: “#4c1d95”,
-“icon”: “⚡”,
-“contracts”: “0 new CSPs”, “dte”: “30–45 DTE (wildcard only)”, “delta”: “Δ ~0.35”,
-“instrument”: “No CSPs. Wildcard: TQQQ long calls if all triggers met”,
+“icon”: “!!”,
+“contracts”: “0 new CSPs”, “dte”: “30-45 DTE (wildcard only)”, “delta”: “~0.35”,
+“instrument”: “No CSPs. Wildcard: TQQQ long calls if all triggers met.”,
 “action”: “VIX > 40. Minimal size. Wildcard eligible if all 5 triggers confirmed.”,
 “checks”: [
 “QQQ RSI < 25 on daily chart”,
 “VIX9D declining while VIX still elevated”,
 “2+ consecutive positive A/D days”,
-“Entry 2+ days after VIX peak — NOT at peak itself”,
+“Entry 2+ days after VIX peak - NOT at peak itself”,
 “Max wildcard: 2% of NLV per trade”,
 ],
 },
 }
 
-# ── Data fetching ─────────────────────────────────────────────────────────────
+# Data fetching
 
-@st.cache_data(ttl=300)  # cache 5 minutes
+@st.cache_data(ttl=300)
 def fetch_data(api_key, secret_key):
 try:
 from alpaca.data.historical import StockHistoricalDataClient
@@ -190,13 +179,12 @@ from alpaca.data.timeframe import TimeFrame
         if symbol in df.index.get_level_values(0):
             df = df.loc[symbol]
         df = df.sort_index()
-        closes = [float(row['close']) for _, row in df.iterrows()]
+        closes = [float(row["close"]) for _, row in df.iterrows()]
         dates  = [str(idx.date()) for idx in df.index]
         return closes[-limit:], dates[-limit:]
 
     qqq_closes, qqq_dates = get_closes("QQQ", 220)
 
-    # VIX proxy — try symbols in order
     vix_raw = None
     vix_sym = None
     for sym in ["VIXY", "VXX"]:
@@ -212,7 +200,6 @@ from alpaca.data.timeframe import TimeFrame
     if vix_raw is None:
         raise ValueError("Could not fetch VIX proxy (VIXY/VXX)")
 
-    # Scale to approximate VIX: VIXY * 3.5
     vix_est = round(vix_raw * 3.5, 1)
 
     return {
@@ -230,32 +217,27 @@ except Exception as e:
     return {"error": str(e)}
 ```
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# UI
 
-# Header
-
-st.markdown(”### 📊 V10 Morning Regime Check”)
+st.markdown(”### V10 Morning Regime Check”)
 et_now = datetime.now(ZoneInfo(“America/New_York”))
-st.caption(et_now.strftime(”%A, %B %d, %Y  ·  %I:%M %p ET”))
+st.caption(et_now.strftime(”%A, %B %d, %Y  -  %I:%M %p ET”))
 st.divider()
 
-# API Keys — stored in session state
+# API Keys - reads from Streamlit Secrets first, falls back to manual entry
 
-with st.expander(“🔑 API Keys”, expanded=not st.session_state.get(“keys_saved”)):
-api_key    = st.text_input(“Alpaca API Key ID”,    value=st.session_state.get(“api_key”, “”),    type=“default”)
-secret_key = st.text_input(“Alpaca Secret Key”,    value=st.session_state.get(“secret_key”, “”), type=“password”)
-if st.button(“Save Keys”):
-st.session_state[“api_key”]    = api_key
-st.session_state[“secret_key”] = secret_key
-st.session_state[“keys_saved”] = True
-st.success(“Keys saved for this session.”)
+api_key    = st.secrets.get(“ALPACA_API_KEY”, “”)
+secret_key = st.secrets.get(“ALPACA_SECRET_KEY”, “”)
 
-api_key    = st.secrets.get("ALPACA_API_KEY", st.session_state.get("api_key", ""))
-secret_key = st.secrets.get("ALPACA_SECRET_KEY", st.session_state.get("secret_key", ""))
+if not api_key or not secret_key:
+with st.expander(“API Keys (not set in Secrets)”, expanded=True):
+api_key    = st.text_input(“Alpaca API Key ID”, type=“default”)
+secret_key = st.text_input(“Alpaca Secret Key”, type=“password”)
+st.caption(“To avoid entering keys every time: add them to Streamlit Secrets in your app settings.”)
 
 # Run button
 
-if st.button(“▶  Run Regime Check”):
+if st.button(“Run Regime Check”):
 if not api_key or not secret_key:
 st.error(“Enter your Alpaca API keys above first.”)
 else:
@@ -264,8 +246,8 @@ data = fetch_data(api_key, secret_key)
 
 ```
     if data.get("error"):
-        st.error(f"**Error:** {data['error']}")
-        st.info("Common fixes: check your API keys, make sure markets have traded recently, verify VIXY is on your Alpaca plan.")
+        st.error(f"Error: {data['error']}")
+        st.info("Common fixes: check your API keys, make sure markets have traded recently.")
     else:
         qqq   = data["qqq_price"]
         sma   = data["sma200"]
@@ -275,55 +257,59 @@ data = fetch_data(api_key, secret_key)
         cfg   = REGIMES[regime]
         above = qqq > sma
 
-        # ── Regime banner
         sign = "+" if pct_vs_sma >= 0 else ""
-        st.markdown(f"""
-        <div class="regime-card" style="background:{cfg['bg']};border-color:{cfg['border']}">
-            <div style="font-size:0.75rem;color:{cfg['color']};letter-spacing:0.15em;margin-bottom:4px">REGIME</div>
-            <div style="font-size:2rem;font-weight:900;color:{cfg['color']}">{cfg['icon']} {regime}</div>
-            <div style="color:#94a3b8;font-size:0.85rem;margin-top:8px">{cfg['action']}</div>
-        </div>
-        """, unsafe_allow_html=True)
 
-        # ── Market data grid
+        # Regime banner
+        st.markdown(f"""
+```
+
+<div class="regime-card" style="background:{cfg['bg']};border-color:{cfg['border']}">
+  <div style="font-size:0.75rem;color:{cfg['color']};letter-spacing:0.15em;margin-bottom:4px">REGIME</div>
+  <div style="font-size:2rem;font-weight:900;color:{cfg['color']}">{cfg['icon']} {regime}</div>
+  <div style="color:#94a3b8;font-size:0.85rem;margin-top:8px">{cfg['action']}</div>
+</div>
+""", unsafe_allow_html=True)
+
+```
+        # Market data
         st.markdown("#### Market Data")
         col1, col2 = st.columns(2)
         with col1:
             st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">QQQ</div>
-              <div class="metric-value">${qqq:.2f}</div>
-              <div style="color:#64748b;font-size:0.75rem">{data['qqq_date']}</div>
-            </div>""", unsafe_allow_html=True)
-            color_sma = "#4ade80" if above else "#f87171"
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">vs 200MA</div>
-              <div class="metric-value" style="color:{color_sma}">{sign}{pct_vs_sma:.2f}%</div>
-              <div style="color:#64748b;font-size:0.75rem">200MA = ${sma:.2f}</div>
-            </div>""", unsafe_allow_html=True)
-        with col2:
-            vix_color = "#f87171" if vix > 30 else "#fbbf24" if vix > 20 else "#4ade80"
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">VIX (est.)</div>
-              <div class="metric-value" style="color:{vix_color}">{vix:.1f}</div>
-              <div style="color:#64748b;font-size:0.75rem">via {data['vix_sym']} ×3.5</div>
-            </div>""", unsafe_allow_html=True)
-            rsi_color = "#f87171" if rsi and rsi < 30 else "#fbbf24" if rsi and rsi > 70 else "#94a3b8"
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">QQQ RSI(14)</div>
-              <div class="metric-value" style="color:{rsi_color}">{rsi if rsi else 'N/A'}</div>
-              <div style="color:#64748b;font-size:0.75rem">daily</div>
-            </div>""", unsafe_allow_html=True)
+```
 
-        st.markdown("""
-        <div style="font-size:0.75rem;color:#475569;margin-top:-4px;margin-bottom:12px">
-        ⚠️ VIX is estimated from ETF proxy. Verify on CBOE if near a regime boundary (18-22 or 38-42).
-        </div>""", unsafe_allow_html=True)
+<div class="metric-card">
+  <div class="metric-label">QQQ</div>
+  <div class="metric-value">${qqq:.2f}</div>
+  <div style="color:#64748b;font-size:0.75rem">{data['qqq_date']}</div>
+</div>""", unsafe_allow_html=True)
+                color_sma = "#4ade80" if above else "#f87171"
+                st.markdown(f"""
+<div class="metric-card">
+  <div class="metric-label">vs 200MA</div>
+  <div class="metric-value" style="color:{color_sma}">{sign}{pct_vs_sma:.2f}%</div>
+  <div style="color:#64748b;font-size:0.75rem">200MA = ${sma:.2f}</div>
+</div>""", unsafe_allow_html=True)
+            with col2:
+                vix_color = "#f87171" if vix > 30 else "#fbbf24" if vix > 20 else "#4ade80"
+                st.markdown(f"""
+<div class="metric-card">
+  <div class="metric-label">VIX (est)</div>
+  <div class="metric-value" style="color:{vix_color}">{vix:.1f}</div>
+  <div style="color:#64748b;font-size:0.75rem">via {data['vix_sym']} x3.5</div>
+</div>""", unsafe_allow_html=True)
+                rsi_color = "#f87171" if rsi and rsi < 30 else "#fbbf24" if rsi and rsi > 70 else "#94a3b8"
+                st.markdown(f"""
+<div class="metric-card">
+  <div class="metric-label">QQQ RSI(14)</div>
+  <div class="metric-value" style="color:{rsi_color}">{rsi if rsi else 'N/A'}</div>
+  <div style="color:#64748b;font-size:0.75rem">daily</div>
+</div>""", unsafe_allow_html=True)
 
-        # ── Playbook
+```
+        st.caption("VIX is estimated from ETF proxy. Verify on CBOE if near a boundary (18-22 or 38-42).")
+
+        # Playbook
         st.markdown("#### Today's Playbook")
         for label, val in [
             ("Instrument", cfg["instrument"]),
@@ -332,33 +318,42 @@ data = fetch_data(api_key, secret_key)
             ("Delta",      cfg["delta"]),
         ]:
             st.markdown(f"""
-            <div class="check-item" style="display:flex;justify-content:space-between">
-              <span style="color:#64748b">{label}</span>
-              <span style="color:#e2e8f0;font-weight:600;text-align:right;max-width:60%">{val}</span>
-            </div>""", unsafe_allow_html=True)
+```
 
-        # ── Checks
+<div class="check-item" style="display:flex;justify-content:space-between">
+  <span style="color:#64748b">{label}</span>
+  <span style="color:#e2e8f0;font-weight:600;text-align:right">{val}</span>
+</div>""", unsafe_allow_html=True)
+
+```
+        # Checks
         st.markdown("#### Before Trading")
         for check in cfg["checks"]:
             st.markdown(f"""
-            <div class="check-item">
-              <span style="color:{cfg['color']};margin-right:8px">›</span>{check}
-            </div>""", unsafe_allow_html=True)
+```
 
-        # ── Exit checklist
+<div class="check-item">
+  <span style="color:{cfg['color']};margin-right:8px">&gt;</span>{check}
+</div>""", unsafe_allow_html=True)
+
+```
+        # Exit checklist
         st.markdown("#### Open Position Exit Check")
         for item in [
-            "Has the option/spread doubled in value? → STOP",
-            "Has the short strike been breached? → ITM exit",
-            "Has QQQ confirmed a regime change? → EXIT",
+            "Has the option/spread doubled in value? (stop)",
+            "Has the short strike been breached? (ITM)",
+            "Has QQQ confirmed a regime change?",
             "Has the 50% profit GTC order filled?",
         ]:
             st.markdown(f"""
-            <div class="check-item">☐ &nbsp;{item}</div>
-            """, unsafe_allow_html=True)
+```
 
-        st.success(f"✅ Report generated at {et_now.strftime('%I:%M %p ET')}")
+<div class="check-item">[ ] &nbsp;{item}</div>
+""", unsafe_allow_html=True)
+
+```
+        st.success("Report generated at " + et_now.strftime("%I:%M %p ET"))
 ```
 
 st.divider()
-st.caption(“V10 Playbook · For personal use only · Not financial advice”)
+st.caption(“V10 Playbook - For personal use only - Not financial advice”)
