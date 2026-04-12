@@ -134,6 +134,7 @@ def fetch_data(api_key, secret_key):
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
+                feed="iex",
             )
             bars = client.get_stock_bars(req)
             df = bars.df
