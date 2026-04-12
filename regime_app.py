@@ -6,15 +6,15 @@ from zoneinfo import ZoneInfo
 # Page config
 
 st.set_page_config(
-page_title=“V10 Regime Check”,
-page_icon=“📊”,
-layout=“centered”,
-initial_sidebar_state=“collapsed”,
+page_title="V10 Regime Check",
+page_icon="📊",
+layout="centered",
+initial_sidebar_state="collapsed",
 )
 
 # Styling
 
-st.markdown(”””
+st.markdown("""
 
 <style>
     .stApp { background-color: #0a0a0f; }
@@ -49,7 +49,7 @@ st.markdown(”””
     }
 </style>
 
-“””, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # V10 Calculations
 
@@ -76,78 +76,78 @@ def determine_regime(qqq, sma200, vix):
 above = qqq > sma200
 pct = (qqq - sma200) / sma200 * 100
 if vix > 40:
-return “CAPITULATION”, pct
+return "CAPITULATION", pct
 if not above:
 pct_below = (sma200 - qqq) / sma200 * 100
 if pct_below <= 5 and 20 <= vix <= 28:
-return “NO MAN’S LAND”, pct
-return “STRESS”, pct
+return "NO MAN’S LAND", pct
+return "STRESS", pct
 if vix < 20:
-return “TREND”, pct
-return “TENSION”, pct
+return "TREND", pct
+return "TENSION", pct
 
 REGIMES = {
-“TREND”: {
-“color”: “#16a34a”, “bg”: “#052e16”, “border”: “#166534”,
-“icon”: “UP”,
-“contracts”: “6 contracts”, “dte”: “7 DTE”, “delta”: “0.20-0.30”,
-“instrument”: “TQQQ cash-secured puts”,
-“action”: “Full CSP engine active. Set GTC profit-take at 50% immediately after fill.”,
-“checks”: [
-“Check % stocks above 200MA (StockCharts $NAA200R)”,
-“> 55% = full 6 contracts”,
-“40-55% = reduce to 4 contracts (Tension sizing)”,
-“< 40% = reduce to 4 contracts”,
+"TREND": {
+"color": "#16a34a", "bg": "#052e16", "border": "#166534",
+"icon": "UP",
+"contracts": "6 contracts", "dte": "7 DTE", "delta": "0.20-0.30",
+"instrument": "TQQQ cash-secured puts",
+"action": "Full CSP engine active. Set GTC profit-take at 50% immediately after fill.",
+"checks": [
+"Check % stocks above 200MA (StockCharts $NAA200R)",
+"> 55% = full 6 contracts",
+"40-55% = reduce to 4 contracts (Tension sizing)",
+"< 40% = reduce to 4 contracts",
 ],
 },
-“TENSION”: {
-“color”: “#d97706”, “bg”: “#1c1000”, “border”: “#92400e”,
-“icon”: “~~”,
-“contracts”: “4 contracts”, “dte”: “14-21 DTE”, “delta”: “0.15-0.20”,
-“instrument”: “TQQQ cash-secured puts (further OTM)”,
-“action”: “Reduced engine. Wider DTE for buffer. Monitor 200MA daily.”,
-“checks”: [
-“Watch for QQQ reclaiming or losing 200MA”,
-“VIX rising toward 28+ = reduce to 2 contracts”,
+"TENSION": {
+"color": "#d97706", "bg": "#1c1000", "border": "#92400e",
+"icon": "~~",
+"contracts": "4 contracts", "dte": "14-21 DTE", "delta": "0.15-0.20",
+"instrument": "TQQQ cash-secured puts (further OTM)",
+"action": "Reduced engine. Wider DTE for buffer. Monitor 200MA daily.",
+"checks": [
+"Watch for QQQ reclaiming or losing 200MA",
+"VIX rising toward 28+ = reduce to 2 contracts",
 ],
 },
-“NO MAN’S LAND”: {
-“color”: “#d97706”, “bg”: “#1c1000”, “border”: “#92400e”,
-“icon”: “??”,
-“contracts”: “0 unless filter passes”, “dte”: “7-10 DTE”, “delta”: “0.20-0.30”,
-“instrument”: “SPXS or SQQQ credit spreads only”,
-“action”: “DO NOT TRADE unless spread credit >= 25% of width. Median 2-day cluster.”,
-“checks”: [
-“Run credit filter before any entry”,
-“Net credit >= 25% of spread width required”,
-“If no spread passes the filter: stay cash”,
+"NO MAN’S LAND": {
+"color": "#d97706", "bg": "#1c1000", "border": "#92400e",
+"icon": "??",
+"contracts": "0 unless filter passes", "dte": "7-10 DTE", "delta": "0.20-0.30",
+"instrument": "SPXS or SQQQ credit spreads only",
+"action": "DO NOT TRADE unless spread credit >= 25% of width. Median 2-day cluster.",
+"checks": [
+"Run credit filter before any entry",
+"Net credit >= 25% of spread width required",
+"If no spread passes the filter: stay cash",
 ],
 },
-“STRESS”: {
-“color”: “#dc2626”, “bg”: “#1a0000”, “border”: “#7f1d1d”,
-“icon”: “DN”,
-“contracts”: “0 new TQQQ CSPs”, “dte”: “7-10 DTE”, “delta”: “0.20-0.30”,
-“instrument”: “SPXS spreads (preferred) / SQQQ credit spreads”,
-“action”: “Inverse spread engine. No new TQQQ positions.”,
-“checks”: [
-“Credit filter: net credit >= 25% of width”,
-“Short leg >= 5% OTM from current SPXS/SQQQ price”,
-“Max collateral per spread: 15% of NLV”,
-“SQQQ valid for spreads at any account size”,
+"STRESS": {
+"color": "#dc2626", "bg": "#1a0000", "border": "#7f1d1d",
+"icon": "DN",
+"contracts": "0 new TQQQ CSPs", "dte": "7-10 DTE", "delta": "0.20-0.30",
+"instrument": "SPXS spreads (preferred) / SQQQ credit spreads",
+"action": "Inverse spread engine. No new TQQQ positions.",
+"checks": [
+"Credit filter: net credit >= 25% of width",
+"Short leg >= 5% OTM from current SPXS/SQQQ price",
+"Max collateral per spread: 15% of NLV",
+"SQQQ valid for spreads at any account size",
 ],
 },
-“CAPITULATION”: {
-“color”: “#7c3aed”, “bg”: “#0d0520”, “border”: “#4c1d95”,
-“icon”: “!!”,
-“contracts”: “0 new CSPs”, “dte”: “30-45 DTE (wildcard only)”, “delta”: “~0.35”,
-“instrument”: “No CSPs. Wildcard: TQQQ long calls if all triggers met.”,
-“action”: “VIX > 40. Minimal size. Wildcard eligible if all 5 triggers confirmed.”,
-“checks”: [
-“QQQ RSI < 25 on daily chart”,
-“VIX9D declining while VIX still elevated”,
-“2+ consecutive positive A/D days”,
-“Entry 2+ days after VIX peak - NOT at peak itself”,
-“Max wildcard: 2% of NLV per trade”,
+"CAPITULATION": {
+"color": "#7c3aed", "bg": "#0d0520", "border": "#4c1d95",
+"icon": "!!",
+"contracts": "0 new CSPs", "dte": "30-45 DTE (wildcard only)", "delta": "~0.35",
+"instrument": "No CSPs. Wildcard: TQQQ long calls if all triggers met.",
+"action": "VIX > 40. Minimal size. Wildcard eligible if all 5 triggers confirmed.",
+"checks": [
+"QQQ RSI < 25 on daily chart",
+"VIX9D declining while VIX still elevated",
+"2+ consecutive positive A/D days",
+"Entry 2+ days after VIX peak - NOT at peak itself",
+"Max wildcard: 2% of NLV per trade",
 ],
 },
 }
@@ -219,29 +219,29 @@ except Exception as e:
 
 # UI
 
-st.markdown(”### V10 Morning Regime Check”)
-et_now = datetime.now(ZoneInfo(“America/New_York”))
-st.caption(et_now.strftime(”%A, %B %d, %Y  -  %I:%M %p ET”))
+st.markdown("### V10 Morning Regime Check")
+et_now = datetime.now(ZoneInfo("America/New_York"))
+st.caption(et_now.strftime("%A, %B %d, %Y  -  %I:%M %p ET"))
 st.divider()
 
 # API Keys - reads from Streamlit Secrets first, falls back to manual entry
 
-api_key    = st.secrets.get(“ALPACA_API_KEY”, “”)
-secret_key = st.secrets.get(“ALPACA_SECRET_KEY”, “”)
+api_key    = st.secrets.get("ALPACA_API_KEY", "")
+secret_key = st.secrets.get("ALPACA_SECRET_KEY", "")
 
 if not api_key or not secret_key:
-with st.expander(“API Keys (not set in Secrets)”, expanded=True):
-api_key    = st.text_input(“Alpaca API Key ID”, type=“default”)
-secret_key = st.text_input(“Alpaca Secret Key”, type=“password”)
-st.caption(“To avoid entering keys every time: add them to Streamlit Secrets in your app settings.”)
+with st.expander("API Keys (not set in Secrets)", expanded=True):
+api_key    = st.text_input("Alpaca API Key ID", type="default")
+secret_key = st.text_input("Alpaca Secret Key", type="password")
+st.caption("To avoid entering keys every time: add them to Streamlit Secrets in your app settings.")
 
 # Run button
 
-if st.button(“Run Regime Check”):
+if st.button("Run Regime Check"):
 if not api_key or not secret_key:
-st.error(“Enter your Alpaca API keys above first.”)
+st.error("Enter your Alpaca API keys above first.")
 else:
-with st.spinner(“Fetching live data from Alpaca…”):
+with st.spinner("Fetching live data from Alpaca…"):
 data = fetch_data(api_key, secret_key)
 
 ```
@@ -356,4 +356,4 @@ data = fetch_data(api_key, secret_key)
 ```
 
 st.divider()
-st.caption(“V10 Playbook - For personal use only - Not financial advice”)
+st.caption("V10 Playbook - For personal use only - Not financial advice")
