@@ -250,8 +250,8 @@ st.session_state[“secret_key”] = secret_key
 st.session_state[“keys_saved”] = True
 st.success(“Keys saved for this session.”)
 
-api_key    = st.session_state.get(“api_key”, “”)
-secret_key = st.session_state.get(“secret_key”, “”)
+api_key    = st.secrets.get("ALPACA_API_KEY", st.session_state.get("api_key", ""))
+secret_key = st.secrets.get("ALPACA_SECRET_KEY", st.session_state.get("secret_key", ""))
 
 # Run button
 
