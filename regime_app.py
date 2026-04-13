@@ -520,7 +520,7 @@ if data:
             f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:{cfg["color"]}">REGIME</div>'
             f'{pill(confidence + " CONFIDENCE", conf_pill_style)}</div>'
             f'<div style="font-size:2rem;font-weight:900;color:{cfg["color"]};margin-bottom:8px">{regime}</div>'
-            f'<div style="color:#475569;font-size:0.83rem">{cfg["action"]}</div></div>',
+            f'<div style="color:#475569;font-size:0.83rem">{sig_note}</div></div>',
             unsafe_allow_html=True,
         )
 
