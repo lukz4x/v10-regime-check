@@ -635,8 +635,8 @@ if data:
         # ── Exit check
         exit_html = "".join([
             f'<div style="padding:6px 0;border-bottom:1px solid #f1f5f9;font-size:0.83rem;color:#475569">'
-            f'<span style="color:#94a3b8;margin-right:8px">[ ]</span>{e}</div>'
-            for e in [
+            f'<span style="color:#94a3b8;margin-right:8px">[ ]</span>{exit_item}</div>'
+            for exit_item in [
                 "Option/spread doubled in value? (stop)",
                 "Short strike breached? (ITM)",
                 "QQQ confirmed regime change?",
