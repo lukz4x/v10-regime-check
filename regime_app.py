@@ -124,7 +124,12 @@ def determine_regime(qqq, sma200, vix, vix_reliable, breadth, gamma_above_flip):
     if bull_signals >= 3 and bear_signals == 0:
         confidence = "HIGH"
     elif bear_signals >= 1:
-        confidence = "LOW"
+        # Even with weak breadth, if VIX is confirmed low and QQQ well above SMA,
+        # downgrade to MODERATE not LOW — breadth caps size but tape is not fragile
+        if vix_reliable and vix < 20 and pct > 3:
+            confidence = "MODERATE"
+        else:
+            confidence = "LOW"
     else:
         confidence = "MEDIUM"
 
@@ -142,6 +147,8 @@ def execution_signal(regime, confidence, vix_reliable):
         return "GO", "green", "Full Trend deployment. Set GTC immediately."
     if regime == "TREND" and confidence == "MEDIUM":
         return "CAUTION", "yellow", "Trend conditions but watch breadth."
+    if regime == "TENSION" and confidence == "MODERATE":
+        return "TREND-LIKE", "yellow", "Breadth-constrained Trend. Deploy at 40-45% cap, 7 DTE."
     if regime == "TENSION" and confidence == "LOW":
         return "CAUTION", "orange", "Fragile Tension. Reduce deployment, stay OTM."
     if regime == "TENSION":
@@ -459,7 +466,11 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
         f"Instrument:       {cfg['instrument']}",
     ]
     if sz_low and sz_high:
-        lines.append(f"Strike Zone:      ${sz_low:.1f} – ${sz_high:.1f} (below put wall / gamma flip)")
+        lines.append(f"Strike Zone:      ${sz_low:.1f} – ${sz_high:.1f} (near put wall, above gamma flip)")
+    # Add breadth override note if applicable
+    if breadth is not None and breadth < 50 and regime in ["TENSION", "TREND"]:
+        lines.append(f"Breadth Override:  Active — full Trend not authorized until breadth > 50%")
+        lines.append(f"                   Current breadth {breadth}% must reach 50%+ to unlock 65% deployment")
     lines += [
         "",
         "--- ENGINES ---",
@@ -579,6 +590,7 @@ if data:
             "red":    ("#991b1b", "#fee2e2", "#fca5a5"),
             "gray":   ("#374151", "#f9fafb", "#e5e7eb"),
         }
+        # TREND-LIKE maps to yellow
         sc = sig_colors.get(sig_color, sig_colors["gray"])
         st.markdown(
             f'<div class="signal-bar" style="background:{sc[1]};border:1.5px solid {sc[2]}">'
@@ -590,14 +602,18 @@ if data:
         )
 
         # ── Regime card
-        conf_pill_style = "green" if confidence == "HIGH" else "yellow" if confidence == "MEDIUM" else "orange"
+        conf_pill_style = "green" if confidence == "HIGH" else "yellow" if confidence in ["MEDIUM", "MODERATE"] else "orange"
         st.markdown(
             f'<div class="regime-card" style="background:{cfg["bg"]};border-color:{cfg["border"]}">'
             f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
             f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:{cfg["color"]}">REGIME</div>'
             f'{pill(confidence + " CONFIDENCE", conf_pill_style)}</div>'
             f'<div style="font-size:2rem;font-weight:900;color:{cfg["color"]};margin-bottom:8px">{regime}</div>'
-            f'<div style="color:#475569;font-size:0.83rem">{sig_note}</div></div>',
+            f'<div style="color:#475569;font-size:0.83rem">{sig_note}</div>'
+            + (f'<div style="color:#d97706;font-size:0.78rem;margin-top:6px">'
+               f'Breadth override active: full Trend not authorized until breadth &gt; 50% (current: {breadth_val}%)</div>'
+               if breadth_val is not None and breadth_val < 50 and regime in ["TENSION", "TREND"] else "")
+            + "</div>",
             unsafe_allow_html=True,
         )
 
