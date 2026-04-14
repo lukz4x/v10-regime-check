@@ -202,7 +202,7 @@ REGIMES = {
     "TENSION": {
         "color": "#d97706", "bg": "#fffbeb", "border": "#fcd34d",
         "bullish_csp": True, "inverse": False, "wildcard": False,
-        "max_cap": 45, "dte": "14-21 DTE", "delta": "0.15-0.20",
+        "max_cap": 45, "dte": "7 DTE", "delta": "0.15-0.20",
         "instrument": "TQQQ cash-secured puts (further OTM)",
         "engines": {"Trend CSP": False, "Tension CSP": True, "Stress/Inverse": False, "Wildcard": False},
         "checks": [
@@ -326,6 +326,74 @@ def fetch_data(api_key, secret_key):
             "tqqq_price": tqqq_price,
             "error": None,
         }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
+# ── Option chain fetch ────────────────────────────────────────────────────────
+@st.cache_data(ttl=180)
+def fetch_option_chains(api_key, secret_key, tqqq_price):
+    """Fetch put chains for next two Fridays from Alpaca."""
+    try:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionChainRequest
+        from alpaca.trading.enums import ContractType
+        from datetime import date, timedelta
+
+        client = OptionHistoricalDataClient(api_key, secret_key)
+
+        # Calculate next two Fridays
+        today = date.today()
+        days_ahead = (4 - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        next_friday = today + timedelta(days=days_ahead)
+        friday_after = next_friday + timedelta(days=7)
+
+        results = {}
+        for exp in [next_friday, friday_after]:
+            label = f"{exp.strftime('%b %d')} ({(exp - today).days} DTE)"
+            try:
+                # Fetch puts near current price: 10% OTM range
+                req = OptionChainRequest(
+                    underlying_symbol="TQQQ",
+                    type=ContractType.PUT,
+                    expiration_date=str(exp),
+                    strike_price_gte=tqqq_price * 0.85,
+                    strike_price_lte=tqqq_price * 1.02,
+                )
+                chain = client.get_option_chain(req)
+                puts = []
+                for symbol, snapshot in chain.items():
+                    try:
+                        strike = snapshot.latest_quote.ask_price  # will fix below
+                        # Extract strike from symbol (e.g. TQQQ260417P00048000)
+                        strike_str = symbol[-8:]
+                        strike_val = int(strike_str) / 1000
+                        bid = snapshot.latest_quote.bid_price if snapshot.latest_quote else 0
+                        ask = snapshot.latest_quote.ask_price if snapshot.latest_quote else 0
+                        mid = round((bid + ask) / 2, 2)
+                        delta = None
+                        if snapshot.greeks:
+                            delta = round(abs(snapshot.greeks.delta), 3)
+                        oi = snapshot.latest_trade.size if snapshot.latest_trade else 0
+                        # credit/width filter prep
+                        puts.append({
+                            "strike": strike_val,
+                            "bid": round(bid, 2),
+                            "ask": round(ask, 2),
+                            "mid": mid,
+                            "delta": delta,
+                        })
+                    except Exception:
+                        continue
+                puts.sort(key=lambda x: x["strike"], reverse=True)
+                results[label] = puts
+            except Exception as ex:
+                results[label] = {"error": str(ex)}
+
+        return results
     except Exception as e:
         return {"error": str(e)}
 
@@ -529,7 +597,7 @@ if data:
             f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:{cfg["color"]}">REGIME</div>'
             f'{pill(confidence + " CONFIDENCE", conf_pill_style)}</div>'
             f'<div style="font-size:2rem;font-weight:900;color:{cfg["color"]};margin-bottom:8px">{regime}</div>'
-            f'<div style="color:#475569;font-size:0.83rem">{sig_note}</div></div>',
+            f'<div style="color:#475569;font-size:0.83rem">{cfg["action"]}</div></div>',
             unsafe_allow_html=True,
         )
 
@@ -718,6 +786,65 @@ if data:
             )
         else:
             st.info("No bullish CSP deployment in current regime. Inverse spread collateral = spread width x contracts.")
+
+
+        # ── Option Chains
+        if tqqq_price and cfg["bullish_csp"] and api_key and secret_key:
+            st.markdown("---")
+            st.markdown("#### TQQQ Put Chains")
+            st.caption("Next two expirations. Fetching live from Alpaca...")
+            with st.spinner("Loading option chains..."):
+                chains = fetch_option_chains(api_key, secret_key, tqqq_price)
+
+            if "error" in chains:
+                st.warning("Could not load chains: " + chains["error"])
+            else:
+                for exp_label, puts in chains.items():
+                    st.markdown(f"**{exp_label}**")
+                    if isinstance(puts, dict) and "error" in puts:
+                        st.caption("Error: " + puts["error"])
+                        continue
+                    if not puts:
+                        st.caption("No data returned for this expiry.")
+                        continue
+
+                    # Filter to strikes within reasonable range
+                    filtered = [p for p in puts if p["bid"] > 0.05][:12]
+
+                    if filtered:
+                        # Table header
+                        st.markdown(
+                            '<div class="section-card">'
+                            '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;'
+                            'gap:4px;font-size:0.72rem;color:#64748b;font-weight:700;'
+                            'padding:6px 0;border-bottom:2px solid #e2e8f0;margin-bottom:4px">'
+                            '<span>Strike</span><span>Bid</span><span>Ask</span>'
+                            '<span>Mid</span><span>Delta</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                        rows_html = ""
+                        for p in filtered:
+                            # Highlight strikes in suggested zone
+                            in_zone = sz_low and sz_high and sz_low <= p["strike"] <= sz_high
+                            bg = "background:#f0fdf4;" if in_zone else ""
+                            delta_str = f"{p['delta']:.3f}" if p["delta"] else "—"
+                            credit_pct = ""
+                            rows_html += (
+                                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;'
+                                f'gap:4px;font-size:0.8rem;padding:5px 0;border-bottom:1px solid #f1f5f9;{bg}">'
+                                f'<span style="font-weight:{"700" if in_zone else "400"};color:{"#166534" if in_zone else "#1e293b"}">'
+                                f'${p["strike"]:.1f}{"  ✓" if in_zone else ""}</span>'
+                                f'<span style="color:#334155">${p["bid"]:.2f}</span>'
+                                f'<span style="color:#334155">${p["ask"]:.2f}</span>'
+                                f'<span style="font-weight:600;color:#1e293b">${p["mid"]:.2f}</span>'
+                                f'<span style="color:#64748b">{delta_str}</span>'
+                                f'</div>'
+                            )
+                        st.markdown(rows_html + "</div>", unsafe_allow_html=True)
+                        if sz_low and sz_high:
+                            st.caption(f"✓ = within suggested strike zone (${sz_low:.1f}–${sz_high:.1f})")
+                    else:
+                        st.caption("No liquid strikes found for this expiry.")
 
         # ── Copy for AI
         st.markdown("---")
