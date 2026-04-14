@@ -153,26 +153,35 @@ def suggested_deployment(regime, confidence, breadth):
     if regime == "TREND":
         if confidence == "HIGH":
             return 65, "Full cap — breadth and VIX confirmed"
+        if breadth is not None and breadth >= 50:
+            return 55, "Near full — breadth approaching confirmation"
         return 50, "Reduced — breadth not fully confirmed"
     if regime == "TENSION":
-        if confidence == "LOW" or (breadth is not None and breadth < 40):
-            return 30, "Weak breadth — stay defensive"
-        if breadth is not None and breadth < 50:
-            return 35, "Improving but still weak breadth"
-        return 45, "Standard Tension cap"
+        # V10 Tension cap is 45%. Breadth reduces within range, never below 40%.
+        if breadth is not None and breadth < 40:
+            return 40, "Weak breadth — reduced but within Tension cap"
+        return 45, "Standard Tension cap — watch breadth for Trend upgrade"
     return 0, "No bullish deployment allowed"
 
 
 def strike_zone(tqqq_price, put_wall, gamma_flip):
+    """
+    Strike zone is based on current price and put wall, not gamma flip.
+    Gamma flip is a risk threshold - we sell below the put wall which is
+    where dealer support exists. Target: 2-5% OTM from current price,
+    anchored below put wall if one is provided.
+    """
     if tqqq_price is None:
         return None, None
-    if put_wall and gamma_flip:
-        preferred_low = min(put_wall, gamma_flip) - 1
-        preferred_high = min(put_wall, gamma_flip)
-        return preferred_low, preferred_high
-    if put_wall:
-        return put_wall - 1, put_wall
-    return None, None
+    # Primary: use put wall as upper anchor (sell below it)
+    if put_wall and put_wall < tqqq_price:
+        sz_high = put_wall
+        sz_low = round(put_wall - 1.5, 1)
+        return sz_low, sz_high
+    # Fallback: 3-5% OTM from current price
+    sz_high = round(tqqq_price * 0.97, 1)
+    sz_low = round(tqqq_price * 0.95, 1)
+    return sz_low, sz_high
 
 
 # ── Regime config ─────────────────────────────────────────────────────────────
@@ -520,7 +529,7 @@ if data:
             f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:{cfg["color"]}">REGIME</div>'
             f'{pill(confidence + " CONFIDENCE", conf_pill_style)}</div>'
             f'<div style="font-size:2rem;font-weight:900;color:{cfg["color"]};margin-bottom:8px">{regime}</div>'
-            f'<div style="color:#475569;font-size:0.83rem">{sig_note}</div></div>',
+            f'<div style="color:#475569;font-size:0.83rem">{cfg["action"]}</div></div>',
             unsafe_allow_html=True,
         )
 
