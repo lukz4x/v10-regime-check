@@ -117,13 +117,20 @@ def determine_regime(qqq, sma200, vix, vix_reliable, breadth, gamma_above_flip):
         if regime == "TREND":
             regime = "TENSION"
 
-    if bull_signals >= 3 and bear_signals == 0:
+    # Breadth 40-55%: moderate zone — does not award bull signal,
+    # but also caps confidence at MEDIUM even if other signals are strong
+    breadth_moderate = (breadth is not None and 40 <= breadth < 55)
+
+    if bull_signals >= 3 and bear_signals == 0 and not breadth_moderate:
         confidence = "HIGH"
     elif bear_signals >= 1:
         if vix_reliable and vix < 20 and pct > 3:
             confidence = "MODERATE"
         else:
             confidence = "LOW"
+    elif breadth_moderate and regime == "TREND":
+        # Strong tape but breadth not yet confirmed — MEDIUM, not HIGH
+        confidence = "MEDIUM"
     else:
         confidence = "MEDIUM"
 
@@ -150,10 +157,12 @@ def execution_signal(regime, confidence, vix_reliable):
 
 def suggested_deployment(regime, confidence, breadth):
     if regime == "TREND":
-        if confidence == "HIGH":
-            return 65, "Full cap — breadth and VIX confirmed"
+        if confidence == "HIGH" and (breadth is None or breadth >= 55):
+            return 65, "Full cap — breadth and VIX confirmed (>55%)"
         if breadth is not None and breadth >= 50:
-            return 55, "Near full — breadth approaching confirmation"
+            return 55, "Near full — breadth moderate (40-55%), not yet confirmed"
+        if breadth is not None and breadth >= 40:
+            return 50, "Reduced — breadth in moderate zone, watch for >55% upgrade"
         return 50, "Reduced — breadth not fully confirmed"
     if regime == "TENSION":
         if breadth is not None and breadth < 40:
@@ -466,6 +475,81 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
     except Exception as e:
         return {"error": str(e), "chains": {}}
 
+
+# ── NDX100 components (as of Q1 2026) ────────────────────────────────────────
+NDX100 = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","COST",
+    "NFLX","TMUS","ASML","AMD","PEP","LIN","ADBE","QCOM","CSCO","TXN",
+    "INTU","ISRG","AMGN","BKNG","AMAT","MU","HON","ADI","VRTX","PANW",
+    "SBUX","LRCX","GILD","REGN","MELI","KDP","CTAS","MDLZ","INTC","CDNS",
+    "KLAC","SNPS","PYPL","CRWD","ORLY","NXPI","CEG","ABNB","WDAY","MNST",
+    "MRVL","FTNT","ADSK","PCAR","ROST","FANG","DXCM","ODFL","CHTR","CPRT",
+    "IDXX","FAST","PAYX","VRSK","BIIB","CSGP","EA","GEHC","EXC","ZS",
+    "DDOG","MRNA","BKR","CCEP","TTWO","ON","XEL","TEAM","ANSS","GFS",
+    "DLTR","WBA","PDD","CDW","ILMN","SIRI","ORCL","AZN","ARM","DASH",
+    "PLTR","MSTR","APP","TTD","HOOD","SMCI","RBLX","ANET","HUBS","ALGN",
+]
+
+@st.cache_data(ttl=600)
+def fetch_breadth(api_key, secret_key):
+    """
+    Compute % of NDX100 stocks above their 200-day SMA.
+    Single bulk bar request — works on both paper and live Alpaca keys.
+    """
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        client = StockHistoricalDataClient(api_key, secret_key)
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        end = datetime.now(et)
+        start = end - timedelta(days=320)
+
+        req = StockBarsRequest(
+            symbol_or_symbols=NDX100,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+            feed="iex",
+        )
+        bars = client.get_stock_bars(req).df
+
+        above = 0
+        total = 0
+        missing = []
+        for sym in NDX100:
+            try:
+                if sym in bars.index.get_level_values(0):
+                    closes = bars.loc[sym]["close"].values
+                else:
+                    missing.append(sym)
+                    continue
+                if len(closes) < 200:
+                    missing.append(sym)
+                    continue
+                sma200 = float(closes[-200:].mean())
+                current = float(closes[-1])
+                total += 1
+                if current > sma200:
+                    above += 1
+            except Exception:
+                missing.append(sym)
+                continue
+
+        if total == 0:
+            return None, "No stocks computed"
+
+        pct = round(above / total * 100)
+        note = f"{above}/{total} stocks above 200MA"
+        if missing:
+            note += f" ({len(missing)} skipped)"
+        return pct, note
+
+    except Exception as e:
+        return None, str(e)
+
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
 def pill(text, style="gray"):
@@ -529,7 +613,7 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
     ]
     if sz_low and sz_high:
         lines.append(f"Strike Zone:      ${sz_low:.1f} – ${sz_high:.1f} (below put wall)")
-    if breadth is not None and breadth < 50 and regime in ["TENSION", "TREND"]:
+    if breadth is not None and breadth < 55 and regime in ["TENSION", "TREND"] and dep_pct < 65:
         lines.append(f"Breadth Override:  Active — full Trend not authorized until breadth > 50%")
         lines.append(f"                   Current breadth {breadth}% must reach 50%+ to unlock 65% deployment")
     lines += [
@@ -574,7 +658,7 @@ if not api_key or not secret_key:
         st.caption("Add to Streamlit Secrets to avoid entering every time.")
 
 st.markdown("#### Manual Inputs")
-st.caption("Breadth from StockCharts $NAA200R. Gamma/walls auto-calculated when chains load. VIX auto-fetched.")
+st.caption("Breadth auto-computed from NDX100 vs 200MA on Run. Override below only if needed. Gamma/walls and VIX auto-fetched.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -600,6 +684,17 @@ with col2:
     )
 
 breadth_val = int(breadth_raw) if breadth_raw and breadth_raw > 0 else None
+# Use auto-computed breadth if no manual override
+auto_breadth = st.session_state.get("auto_breadth")
+breadth_note_auto = st.session_state.get("breadth_note", "")
+if breadth_val is None and auto_breadth is not None:
+    breadth_val = auto_breadth
+    breadth_source = f"auto (NDX100): {breadth_note_auto}"
+elif breadth_val is not None:
+    breadth_source = "manual override"
+else:
+    breadth_source = "not available"
+
 gamma_flip_manual = float(gamma_flip_raw) if gamma_flip_raw and gamma_flip_raw > 0 else None
 put_wall_manual = float(put_wall_raw) if put_wall_raw and put_wall_raw > 0 else None
 vix_manual_val = float(vix_manual_raw) if vix_manual_raw and vix_manual_raw > 0 else None
@@ -618,6 +713,11 @@ if st.button("Run Regime Check", type="primary"):
             with st.spinner("Loading option chains…"):
                 chain_result = fetch_option_chains(api_key, secret_key, fetched["tqqq_price"])
                 st.session_state["chain_data"] = chain_result
+
+        with st.spinner("Computing breadth (NDX100 vs 200MA)…"):
+            auto_breadth, breadth_note = fetch_breadth(api_key, secret_key)
+            st.session_state["auto_breadth"] = auto_breadth
+            st.session_state["breadth_note"] = breadth_note
 
 # ── Display ───────────────────────────────────────────────────────────────────
 data = st.session_state.get("last_data")
@@ -691,7 +791,7 @@ if data:
         # ── Regime card
         conf_pill_style = "green" if confidence == "HIGH" else "yellow" if confidence in ["MEDIUM", "MODERATE"] else "orange"
         breadth_override_html = ""
-        if breadth_val is not None and breadth_val < 50 and regime in ["TENSION", "TREND"]:
+        if breadth_val is not None and breadth_val < 55 and regime in ["TENSION", "TREND"] and dep_pct < 65:
             breadth_override_html = (
                 f'<div style="color:#d97706;font-size:0.78rem;margin-top:6px">'
                 f'Breadth override active: full Trend not authorized until breadth &gt; 50% '
@@ -766,10 +866,11 @@ if data:
         if breadth_val is not None:
             b_style = "green" if breadth_val >= 55 else "yellow" if breadth_val >= 40 else "red"
             b_label = "STRONG" if breadth_val >= 55 else "MODERATE" if breadth_val >= 40 else "WEAK"
+            src_tag = f'<span style="color:#94a3b8;font-size:0.72rem;margin-left:6px">({breadth_source})</span>'
             struct_rows.append(row_html("Breadth (% > 200MA)",
-                f'{pill(b_label, b_style)} <span style="margin-left:6px">{breadth_val}%</span>'))
+                f'{pill(b_label, b_style)} <span style="margin-left:6px">{breadth_val}%</span>{src_tag}'))
         else:
-            struct_rows.append(row_html("Breadth (% > 200MA)", pill("Not entered — check StockCharts $NAA200R", "gray")))
+            struct_rows.append(row_html("Breadth (% > 200MA)", pill("Computing… run check to fetch", "gray")))
         if sz_low and sz_high:
             struct_rows.append(row_html("Suggested Strike Zone",
                 f'<span style="color:#166534;font-weight:700">${sz_low:.1f} – ${sz_high:.1f}</span>'
