@@ -303,20 +303,32 @@ def fetch_data(api_key, secret_key):
         except Exception:
             pass
 
-        # VIX: try direct index, flag reliability
+        # VIX: try yfinance first (real index), then ETF proxy
         vix_price = None
         vix_sym = None
         vix_reliable = False
-        for sym in ["VIX", "VIXY", "VXX"]:
-            try:
-                closes, _ = get_closes(sym, 10)
-                if closes:
-                    vix_price = closes[-1]
-                    vix_sym = sym
-                    vix_reliable = (sym == "VIX")
-                    break
-            except Exception:
-                continue
+        try:
+            import yfinance as yf
+            vix_ticker = yf.Ticker("^VIX")
+            vix_hist = vix_ticker.history(period="2d")
+            if not vix_hist.empty:
+                vix_price = round(float(vix_hist["Close"].iloc[-1]), 2)
+                vix_sym = "^VIX"
+                vix_reliable = True
+        except Exception:
+            pass
+
+        if vix_price is None:
+            for sym in ["VIXY", "VXX"]:
+                try:
+                    closes, _ = get_closes(sym, 10)
+                    if closes:
+                        vix_price = closes[-1]
+                        vix_sym = sym
+                        vix_reliable = False
+                        break
+                except Exception:
+                    continue
 
         if vix_price is None:
             raise ValueError("Could not fetch VIX data")
@@ -341,7 +353,11 @@ def fetch_data(api_key, secret_key):
 # ── Option chain fetch ────────────────────────────────────────────────────────
 @st.cache_data(ttl=180)
 def fetch_option_chains(api_key, secret_key, tqqq_price):
-    """Fetch put chains for next two Fridays from Alpaca."""
+    """
+    Fetch put and call chains for next two Fridays.
+    Also calculates put wall, call wall, and gamma flip from OI and greeks.
+    Returns: {chains, put_wall, call_wall, gamma_flip}
+    """
     try:
         from alpaca.data.historical.option import OptionHistoricalDataClient
         from alpaca.data.requests import OptionChainRequest
@@ -350,7 +366,6 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
 
         client = OptionHistoricalDataClient(api_key, secret_key)
 
-        # Calculate next two Fridays
         today = date.today()
         days_ahead = (4 - today.weekday()) % 7
         if days_ahead == 0:
@@ -358,51 +373,120 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
         next_friday = today + timedelta(days=days_ahead)
         friday_after = next_friday + timedelta(days=7)
 
-        results = {}
+        # Aggregate gamma exposure across both expirations for wall/flip calc
+        gamma_by_strike = {}  # strike -> net gamma (calls positive, puts negative)
+        put_oi_by_strike = {}
+        call_oi_by_strike = {}
+
+        chains = {}
+
         for exp in [next_friday, friday_after]:
             label = f"{exp.strftime('%b %d')} ({(exp - today).days} DTE)"
+            puts = []
             try:
-                # Fetch puts near current price: 10% OTM range
+                # Fetch puts
                 req = OptionChainRequest(
                     underlying_symbol="TQQQ",
                     type=ContractType.PUT,
                     expiration_date=str(exp),
-                    strike_price_gte=tqqq_price * 0.85,
-                    strike_price_lte=tqqq_price * 1.02,
+                    strike_price_gte=tqqq_price * 0.82,
+                    strike_price_lte=tqqq_price * 1.05,
                 )
                 chain = client.get_option_chain(req)
-                puts = []
-                for symbol, snapshot in chain.items():
+                for symbol, snap in chain.items():
                     try:
-                        strike = snapshot.latest_quote.ask_price  # will fix below
-                        # Extract strike from symbol (e.g. TQQQ260417P00048000)
-                        strike_str = symbol[-8:]
-                        strike_val = int(strike_str) / 1000
-                        bid = snapshot.latest_quote.bid_price if snapshot.latest_quote else 0
-                        ask = snapshot.latest_quote.ask_price if snapshot.latest_quote else 0
+                        strike_val = int(symbol[-8:]) / 1000
+                        bid = snap.latest_quote.bid_price if snap.latest_quote else 0
+                        ask = snap.latest_quote.ask_price if snap.latest_quote else 0
                         mid = round((bid + ask) / 2, 2)
                         delta = None
-                        if snapshot.greeks:
-                            delta = round(abs(snapshot.greeks.delta), 3)
-                        oi = snapshot.latest_trade.size if snapshot.latest_trade else 0
-                        # credit/width filter prep
-                        puts.append({
-                            "strike": strike_val,
-                            "bid": round(bid, 2),
-                            "ask": round(ask, 2),
-                            "mid": mid,
-                            "delta": delta,
-                        })
+                        gamma = None
+                        oi = 0
+                        if snap.greeks:
+                            delta = round(abs(snap.greeks.delta), 3)
+                            gamma = snap.greeks.gamma or 0
+                        if snap.latest_trade:
+                            oi = snap.latest_trade.size or 0
+                        if bid > 0.05:
+                            puts.append({
+                                "strike": strike_val, "bid": round(bid,2),
+                                "ask": round(ask,2), "mid": mid, "delta": delta,
+                            })
+                        # Accumulate for wall/flip calc (puts are negative gamma)
+                        if strike_val not in gamma_by_strike:
+                            gamma_by_strike[strike_val] = 0
+                        gamma_by_strike[strike_val] -= (gamma or 0) * oi * 100
+                        put_oi_by_strike[strike_val] = put_oi_by_strike.get(strike_val, 0) + oi
                     except Exception:
                         continue
                 puts.sort(key=lambda x: x["strike"], reverse=True)
-                results[label] = puts
+                chains[label] = puts
             except Exception as ex:
-                results[label] = {"error": str(ex)}
+                chains[label] = {"error": str(ex)}
 
-        return results
+            # Fetch calls for wall/flip calc
+            try:
+                req_c = OptionChainRequest(
+                    underlying_symbol="TQQQ",
+                    type=ContractType.CALL,
+                    expiration_date=str(exp),
+                    strike_price_gte=tqqq_price * 0.82,
+                    strike_price_lte=tqqq_price * 1.05,
+                )
+                chain_c = client.get_option_chain(req_c)
+                for symbol, snap in chain_c.items():
+                    try:
+                        strike_val = int(symbol[-8:]) / 1000
+                        gamma = 0
+                        oi = 0
+                        if snap.greeks:
+                            gamma = snap.greeks.gamma or 0
+                        if snap.latest_trade:
+                            oi = snap.latest_trade.size or 0
+                        if strike_val not in gamma_by_strike:
+                            gamma_by_strike[strike_val] = 0
+                        gamma_by_strike[strike_val] += gamma * oi * 100
+                        call_oi_by_strike[strike_val] = call_oi_by_strike.get(strike_val, 0) + oi
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # Calculate walls and gamma flip
+        put_wall = None
+        call_wall = None
+        gamma_flip = None
+
+        if put_oi_by_strike:
+            put_wall = max(put_oi_by_strike, key=put_oi_by_strike.get)
+        if call_oi_by_strike:
+            call_wall = max(call_oi_by_strike, key=call_oi_by_strike.get)
+
+        # Gamma flip: strike where net gamma crosses from negative to positive
+        # (below flip = negative gamma = dealers amplify moves)
+        if gamma_by_strike and tqqq_price:
+            sorted_strikes = sorted(gamma_by_strike.keys())
+            # Find the highest strike below price where gamma is negative
+            below_price = [s for s in sorted_strikes if s <= tqqq_price]
+            for i in range(len(below_price) - 1, 0, -1):
+                s = below_price[i]
+                s_prev = below_price[i-1]
+                if gamma_by_strike.get(s, 0) > 0 and gamma_by_strike.get(s_prev, 0) <= 0:
+                    gamma_flip = round((s + s_prev) / 2, 2)
+                    break
+                elif gamma_by_strike.get(s, 0) <= 0:
+                    gamma_flip = s
+                    break
+
+        return {
+            "chains": chains,
+            "put_wall": round(put_wall, 1) if put_wall else None,
+            "call_wall": round(call_wall, 1) if call_wall else None,
+            "gamma_flip": round(gamma_flip, 2) if gamma_flip else None,
+            "error": None,
+        }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "chains": {}}
 
 
 # ── HTML helpers ──────────────────────────────────────────────────────────────
@@ -513,25 +597,38 @@ if not api_key or not secret_key:
         secret_key = st.text_input("Alpaca Secret Key", type="password")
         st.caption("Add to Streamlit Secrets to avoid entering every time.")
 
-# Manual inputs — always visible
+# Manual inputs
 st.markdown("#### Manual Inputs")
-st.caption("Enter from Barchart (gamma) and StockCharts (breadth). Leave 0 if unknown.")
+st.caption("Breadth from StockCharts $NAA200R. Gamma/walls auto-calculated when chains load. VIX auto-fetched.")
 
 col1, col2 = st.columns(2)
 with col1:
-    breadth = st.number_input("% Stocks Above 200MA", min_value=0, max_value=100, value=0, step=1)
-    gamma_flip = st.number_input("TQQQ Gamma Flip", min_value=0.0, value=0.0, step=0.5)
-    put_wall = st.number_input("TQQQ Put Wall", min_value=0.0, value=0.0, step=0.5)
+    breadth_raw = st.number_input(
+        "% Stocks Above 200MA", min_value=0, max_value=100,
+        value=None, step=1, placeholder="e.g. 39"
+    )
+    vix_manual_raw = st.number_input(
+        "VIX override (optional)", min_value=0.0,
+        value=None, step=0.1, placeholder="Auto-fetched",
+        help="Leave blank to use auto-fetched VIX. Enter manually only to override."
+    )
 with col2:
-    call_wall = st.number_input("TQQQ Call Wall", min_value=0.0, value=0.0, step=0.5)
-    vix_manual = st.number_input("VIX (manual override)", min_value=0.0, value=0.0, step=0.1,
-                                  help="Enter real VIX from CBOE to override the ETF proxy estimate")
+    gamma_flip_raw = st.number_input(
+        "Gamma Flip override", min_value=0.0,
+        value=None, step=0.5, placeholder="Auto-calculated",
+        help="Leave blank — calculated from option chain. Override if you have Barchart value."
+    )
+    put_wall_raw = st.number_input(
+        "Put Wall override", min_value=0.0,
+        value=None, step=0.5, placeholder="Auto-calculated",
+        help="Leave blank — calculated from option chain OI."
+    )
 
-breadth_val = breadth if breadth > 0 else None
-gamma_flip_val = gamma_flip if gamma_flip > 0 else None
-put_wall_val = put_wall if put_wall > 0 else None
-call_wall_val = call_wall if call_wall > 0 else None
-vix_manual_val = vix_manual if vix_manual > 0 else None
+breadth_val = int(breadth_raw) if breadth_raw and breadth_raw > 0 else None
+gamma_flip_val = float(gamma_flip_raw) if gamma_flip_raw and gamma_flip_raw > 0 else None
+put_wall_val = float(put_wall_raw) if put_wall_raw and put_wall_raw > 0 else None
+call_wall_val = None  # always auto-calculated now
+vix_manual_val = float(vix_manual_raw) if vix_manual_raw and vix_manual_raw > 0 else None
 
 if st.button("Run Regime Check", type="primary"):
     if not api_key or not secret_key:
@@ -804,18 +901,46 @@ if data:
             st.info("No bullish CSP deployment in current regime. Inverse spread collateral = spread width x contracts.")
 
 
-        # ── Option Chains
-        if tqqq_price and cfg["bullish_csp"] and api_key and secret_key:
+        # ── Option Chains — also provides auto gamma/wall values
+        chain_data = st.session_state.get("chain_data")
+        if tqqq_price and api_key and secret_key:
             st.markdown("---")
             st.markdown("#### TQQQ Put Chains")
             st.caption("Next two expirations. Fetching live from Alpaca...")
             with st.spinner("Loading option chains..."):
-                chains = fetch_option_chains(api_key, secret_key, tqqq_price)
+                chain_data = fetch_option_chains(api_key, secret_key, tqqq_price)
+                st.session_state["chain_data"] = chain_data
 
-            if "error" in chains:
-                st.warning("Could not load chains: " + chains["error"])
-            else:
-                for exp_label, puts in chains.items():
+            # Use auto-calculated values if manual overrides not provided
+            if chain_data and not chain_data.get("error"):
+                if not gamma_flip_val and chain_data.get("gamma_flip"):
+                    gamma_flip_val = chain_data["gamma_flip"]
+                if not put_wall_val and chain_data.get("put_wall"):
+                    put_wall_val = chain_data["put_wall"]
+                if not call_wall_val and chain_data.get("call_wall"):
+                    call_wall_val = chain_data["call_wall"]
+                # Recalculate gamma_above and strike_zone with updated values
+                if gamma_flip_val and tqqq_price:
+                    gamma_above = tqqq_price > gamma_flip_val
+                sz_low, sz_high = strike_zone(tqqq_price, put_wall_val, gamma_flip_val)
+
+            if not cfg["bullish_csp"]:
+                st.info("Put chains not shown in non-bullish regime.")
+            elif chain_data and chain_data.get("error"):
+                st.warning("Could not load chains: " + chain_data["error"])
+            elif chain_data:
+                # Show auto-detected values
+                auto_vals = []
+                if chain_data.get("put_wall") and not put_wall_raw:
+                    auto_vals.append(f"Put Wall: ${chain_data['put_wall']:.1f}")
+                if chain_data.get("call_wall") and not put_wall_raw:
+                    auto_vals.append(f"Call Wall: ${chain_data['call_wall']:.1f}")
+                if chain_data.get("gamma_flip") and not gamma_flip_raw:
+                    auto_vals.append(f"Gamma Flip: ${chain_data['gamma_flip']:.2f}")
+                if auto_vals:
+                    st.caption("Auto-calculated from chain: " + " | ".join(auto_vals))
+
+                for exp_label, puts in chain_data.get("chains", {}).items():
                     st.markdown(f"**{exp_label}**")
                     if isinstance(puts, dict) and "error" in puts:
                         st.caption("Error: " + puts["error"])
