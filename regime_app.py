@@ -689,16 +689,8 @@ with col2:
         help="Leave blank — calculated from option chain OI."
     )
 
-breadth_val = int(breadth_raw) if breadth_raw and breadth_raw > 0 else None
-# Use auto-computed breadth if no manual override
-auto_breadth = st.session_state.get("auto_breadth")
-breadth_note_auto = st.session_state.get("breadth_note", "not yet fetched")
-breadth_source = "not available"
-if breadth_val is not None:
-    breadth_source = "manual override"
-elif auto_breadth is not None:
-    breadth_val = auto_breadth
-    breadth_source = f"auto (NDX100): {breadth_note_auto}"
+# Manual override only here — auto_breadth resolved inside display block
+breadth_val_manual = int(breadth_raw) if breadth_raw and breadth_raw > 0 else None
 
 gamma_flip_manual = float(gamma_flip_raw) if gamma_flip_raw and gamma_flip_raw > 0 else None
 put_wall_manual = float(put_wall_raw) if put_wall_raw and put_wall_raw > 0 else None
@@ -735,6 +727,19 @@ if data:
         sma = data["sma200"]
         rsi = data["rsi14"]
         tqqq_price = data.get("tqqq_price")
+
+        # Resolve breadth — read session_state HERE so button-press fetch is available
+        auto_breadth = st.session_state.get("auto_breadth")
+        breadth_note_auto = st.session_state.get("breadth_note", "not yet fetched")
+        breadth_source = "not available"
+        if breadth_val_manual is not None:
+            breadth_val = breadth_val_manual
+            breadth_source = "manual override"
+        elif auto_breadth is not None:
+            breadth_val = auto_breadth
+            breadth_source = f"auto (NDX100): {breadth_note_auto}"
+        else:
+            breadth_val = None
 
         # VIX
         if vix_manual_val:
