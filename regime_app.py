@@ -306,24 +306,29 @@ def fetch_data(api_key, secret_key):
         from alpaca.data.timeframe import TimeFrame
 
         client = StockHistoricalDataClient(api_key, secret_key)
-        et = ZoneInfo("America/New_York")
-        end = datetime.now(et)
-        start = end - timedelta(days=320)
 
         def get_closes(symbol, limit=220):
+            # sort=desc + no start date → always returns the most recent
+            # `limit` daily bars regardless of when the call is made.
+            # df.sort_index() then gives chronological (oldest→newest) order
+            # for SMA and Wilder RSI calculations.
+            # The old approach used a fixed start date 320 days back, which
+            # could miss today's bar during pre-close hours or on slow fetches.
             req = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Day,
-                start=start, end=end, feed="iex",
+                limit=limit,
+                sort="desc",   # newest first → df.sort_index() reverses to chronological
+                feed="iex",
             )
             bars = client.get_stock_bars(req)
             df = bars.df
             if symbol in df.index.get_level_values(0):
                 df = df.loc[symbol]
-            df = df.sort_index()
+            df = df.sort_index()   # ascending: oldest → newest
             closes = [float(row["close"]) for _, row in df.iterrows()]
-            dates = [str(idx.date()) for idx in df.index]
-            return closes[-limit:], dates[-limit:]
+            dates  = [str(idx.date()) for idx in df.index]
+            return closes, dates
 
         qqq_closes, qqq_dates = get_closes("QQQ", 220)
 
@@ -653,16 +658,14 @@ def fetch_breadth(api_key, secret_key):
         from alpaca.data.timeframe import TimeFrame
 
         client = StockHistoricalDataClient(api_key, secret_key)
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
-        end = datetime.now(et)
-        start = end - timedelta(days=320)
 
+        # sort=desc + limit=220 → most recent 220 bars per symbol, no start date
+        # needed. df.sort_index() then gives chronological order for SMA calc.
         req = StockBarsRequest(
             symbol_or_symbols=NDX100,
             timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
+            limit=220,
+            sort="desc",
             feed="iex",
         )
         bars = client.get_stock_bars(req).df
