@@ -180,37 +180,47 @@ def suggested_deployment(regime, confidence, breadth):
 def strike_zone(tqqq_price, put_wall, gamma_flip, rsi=None, gamma_at_flip=False):
     """
     AUTHORITATIVE strike zone — called once, used everywhere.
-    Primary: sell below put wall (put wall = upper anchor, dealer support floor).
-    Fallback: 3-5% OTM from current price if no put wall available.
 
-    RSI override: When daily RSI > 80, step zone down one tier (more OTM)
-    to avoid top-end strikes into momentum extension.
-    Gamma flip proximity: When price is within 0.5% of flip, step down further.
+    Put wall validity check: if computed put wall is more than 12% below
+    current price it is almost certainly a stale/legacy wall from prior
+    crash hedges and should be ignored. At TQQQ $56 a valid put wall
+    sits at $50 (11% OTM) — anything below $49 (~13%+) is suspect.
+
+    Fallback when wall is absent or stale: 8-10% OTM from current price.
+    This corresponds to the playbook's 0.20-0.30 delta range at 7-8 DTE
+    and is far more appropriate than the previous 3% fallback.
+
+    RSI override (>80): step zone down one tier (~1.5 pts).
+    Gamma flip proximity (<1% from flip): step down half tier.
     """
     if tqqq_price is None:
         return None, None
 
-    # Determine if we should step down the zone
     rsi_extended = rsi is not None and rsi > 80
-    flip_fragile  = gamma_at_flip  # already computed upstream
+    flip_fragile  = gamma_at_flip
 
-    if put_wall and put_wall < tqqq_price:
+    # Validate put wall — reject if more than 12% below current price
+    # (stale OI from prior crash hedges, not current dealer positioning)
+    wall_valid = (put_wall and
+                  put_wall < tqqq_price and
+                  put_wall >= tqqq_price * 0.88)
+
+    if wall_valid:
         sz_high = put_wall
         sz_low  = round(put_wall - 1.5, 1)
-        # RSI > 80: drop the zone by one full tier (~1.5 pts)
         if rsi_extended:
             sz_high = sz_low
             sz_low  = round(sz_high - 1.5, 1)
-        # Price sitting on gamma flip: drop a half tier on top of any RSI shift
         elif flip_fragile:
             sz_high = round(sz_high - 0.5, 1)
             sz_low  = round(sz_low  - 0.5, 1)
         return sz_low, sz_high
 
-    # Fallback — price-based
-    base_otm = 0.95 if rsi_extended else 0.97
-    sz_high = round(tqqq_price * base_otm, 1)
-    sz_low  = round(tqqq_price * (base_otm - 0.02), 1)
+    # Fallback: 8-10% OTM (playbook delta 0.20-0.30 target at 7-8 DTE)
+    base_high = 0.92 if not rsi_extended else 0.90
+    base_low  = base_high - 0.02
+    sz_high = round(tqqq_price * base_high, 1)
+    sz_low  = round(tqqq_price * base_low,  1)
     return sz_low, sz_high
 
 # ── Regime config ─────────────────────────────────────────────────────────────
