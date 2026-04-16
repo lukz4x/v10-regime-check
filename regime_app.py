@@ -311,10 +311,12 @@ def fetch_data(api_key, secret_key):
         qqq_closes, qqq_dates = get_closes("QQQ", 220)
 
         tqqq_price = None
+        tqqq_rsi14 = None
         try:
-            tqqq_closes, _ = get_closes("TQQQ", 5)
+            tqqq_closes, _ = get_closes("TQQQ", 40)   # 40 bars for proper Wilder RSI warmup
             if tqqq_closes:
                 tqqq_price = tqqq_closes[-1]
+                tqqq_rsi14 = calc_rsi(tqqq_closes, 14)
         except Exception:
             pass
 
@@ -353,6 +355,7 @@ def fetch_data(api_key, secret_key):
             "qqq_price": qqq_closes[-1],
             "sma200": calc_sma(qqq_closes, 200),
             "rsi14": calc_rsi(qqq_closes, 14),
+            "tqqq_rsi14": tqqq_rsi14,
             "vix": round(vix_price, 1),
             "vix_sym": vix_sym,
             "vix_reliable": vix_reliable,
@@ -364,10 +367,112 @@ def fetch_data(api_key, secret_key):
 
 
 @st.cache_data(ttl=180)
+def _gex_from_yfinance(tqqq_price):
+    """
+    Compute put wall, call wall, and gamma flip using yfinance open interest.
+    yfinance provides actual OI across all expirations — much more accurate
+    than Alpaca's indicative feed which has no OI field.
+    Returns (put_wall, call_wall, gamma_flip) or (None, None, None) on failure.
+    """
+    try:
+        import yfinance as yf
+        from datetime import datetime, timezone
+        import math
+
+        t    = yf.Ticker("TQQQ")
+        exps = t.options          # all available expiration dates (strings)
+        if not exps:
+            return None, None, None
+
+        gamma_by_strike   = {}
+        put_oi_by_strike  = {}
+        call_oi_by_strike = {}
+
+        # Use up to 8 nearest expirations — captures bulk of GEX
+        for exp in exps[:8]:
+            try:
+                dte = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days
+                if dte < 0:
+                    continue
+                T = max(dte, 1) / 365.0   # time to expiry in years
+
+                chain = t.option_chain(exp)
+                calls = chain.calls
+                puts  = chain.puts
+
+                # ── Process puts ──────────────────────────────────────────────
+                for _, row in puts.iterrows():
+                    K  = float(row["strike"])
+                    oi = float(row.get("openInterest") or 0)
+                    iv = float(row.get("impliedVolatility") or 0.6)
+                    if oi == 0:
+                        continue
+                    put_oi_by_strike[K] = put_oi_by_strike.get(K, 0) + oi
+                    # BSM gamma approximation: γ = φ(d1) / (S × σ × √T)
+                    # d1 = (ln(S/K) + (σ²/2)T) / (σ√T)
+                    if iv > 0 and T > 0:
+                        d1 = (math.log(tqqq_price / K) + (iv**2 / 2) * T) / (iv * math.sqrt(T))
+                        bsm_gamma = math.exp(-0.5 * d1**2) / (math.sqrt(2 * math.pi) * tqqq_price * iv * math.sqrt(T))
+                    else:
+                        bsm_gamma = 0
+                    gamma_by_strike[K] = gamma_by_strike.get(K, 0) - bsm_gamma * oi * 100
+
+                # ── Process calls ─────────────────────────────────────────────
+                for _, row in calls.iterrows():
+                    K  = float(row["strike"])
+                    oi = float(row.get("openInterest") or 0)
+                    iv = float(row.get("impliedVolatility") or 0.6)
+                    if oi == 0:
+                        continue
+                    call_oi_by_strike[K] = call_oi_by_strike.get(K, 0) + oi
+                    if iv > 0 and T > 0:
+                        d1 = (math.log(tqqq_price / K) + (iv**2 / 2) * T) / (iv * math.sqrt(T))
+                        bsm_gamma = math.exp(-0.5 * d1**2) / (math.sqrt(2 * math.pi) * tqqq_price * iv * math.sqrt(T))
+                    else:
+                        bsm_gamma = 0
+                    gamma_by_strike[K] = gamma_by_strike.get(K, 0) + bsm_gamma * oi * 100
+
+            except Exception:
+                continue
+
+        # ── Walls ─────────────────────────────────────────────────────────────
+        put_wall  = None
+        call_wall = None
+        if put_oi_by_strike:
+            below = {s: v for s, v in put_oi_by_strike.items() if s < tqqq_price}
+            if below:
+                put_wall = round(max(below, key=below.get), 1)
+        if call_oi_by_strike:
+            above = {s: v for s, v in call_oi_by_strike.items() if s > tqqq_price}
+            if above:
+                call_wall = round(max(above, key=above.get), 1)
+
+        # ── Gamma flip: sweep down from ATM looking for net GEX sign change ──
+        gamma_flip = None
+        if gamma_by_strike:
+            strikes_below = sorted([s for s in gamma_by_strike if s <= tqqq_price])
+            for i in range(len(strikes_below) - 1, 0, -1):
+                s      = strikes_below[i]
+                s_prev = strikes_below[i - 1]
+                gs     = gamma_by_strike.get(s, 0)
+                gs_prev= gamma_by_strike.get(s_prev, 0)
+                if gs > 0 and gs_prev <= 0:
+                    gamma_flip = round((s + s_prev) / 2, 2)
+                    break
+                elif gs <= 0:
+                    gamma_flip = round(s, 2)
+                    break
+
+        return put_wall, call_wall, gamma_flip
+
+    except Exception:
+        return None, None, None
+
+
 def fetch_option_chains(api_key, secret_key, tqqq_price):
     """
-    Fetch put chains for next two Fridays.
-    Also fetch calls for gamma/wall calculation.
+    Fetch TQQQ option chains for display (Alpaca — live bid/ask/mid/delta)
+    and compute gamma flip + walls from yfinance OI data (more accurate).
     Returns: {chains, put_wall, call_wall, gamma_flip, error}
     """
     try:
@@ -382,17 +487,15 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
         days_ahead = (4 - today.weekday()) % 7
         if days_ahead == 0:
             days_ahead = 7
-        next_friday = today + timedelta(days=days_ahead)
+        next_friday  = today + timedelta(days=days_ahead)
         friday_after = next_friday + timedelta(days=7)
 
-        gamma_by_strike = {}
-        put_oi_by_strike = {}
-        call_oi_by_strike = {}
         chains = {}
 
+        # ── Fetch put chains for display only (live Alpaca prices) ───────────
         for exp in [next_friday, friday_after]:
             label = f"{exp.strftime('%b %d')} ({(exp - today).days} DTE)"
-            puts = []
+            puts  = []
             try:
                 req = OptionChainRequest(
                     underlying_symbol="TQQQ",
@@ -409,22 +512,13 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
                         ask = snap.latest_quote.ask_price if snap.latest_quote else 0
                         mid = round((bid + ask) / 2, 2)
                         delta = None
-                        gamma = 0
-                        oi = 0
                         if snap.greeks:
                             delta = round(abs(snap.greeks.delta), 3)
-                            gamma = snap.greeks.gamma or 0
-                        if snap.latest_trade:
-                            oi = snap.latest_trade.size or 0
                         if bid > 0.05:
                             puts.append({
                                 "strike": strike_val, "bid": round(bid, 2),
-                                "ask": round(ask, 2), "mid": mid, "delta": delta,
+                                "ask":    round(ask, 2), "mid": mid, "delta": delta,
                             })
-                        if strike_val not in gamma_by_strike:
-                            gamma_by_strike[strike_val] = 0
-                        gamma_by_strike[strike_val] -= (gamma or 0) * max(oi, 1) * 100
-                        put_oi_by_strike[strike_val] = put_oi_by_strike.get(strike_val, 0) + max(oi, 1)
                     except Exception:
                         continue
                 puts.sort(key=lambda x: x["strike"], reverse=True)
@@ -432,73 +526,15 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
             except Exception as ex:
                 chains[label] = {"error": str(ex)}
 
-            # Fetch calls for gamma flip / call wall
-            try:
-                req_c = OptionChainRequest(
-                    underlying_symbol="TQQQ",
-                    type=ContractType.CALL,
-                    expiration_date=str(exp),
-                    strike_price_gte=tqqq_price * 0.82,
-                    strike_price_lte=tqqq_price * 1.05,
-                )
-                chain_c = client.get_option_chain(req_c)
-                for symbol, snap in chain_c.items():
-                    try:
-                        strike_val = int(symbol[-8:]) / 1000
-                        gamma = 0
-                        oi = 0
-                        if snap.greeks:
-                            gamma = snap.greeks.gamma or 0
-                        if snap.latest_trade:
-                            oi = snap.latest_trade.size or 0
-                        if strike_val not in gamma_by_strike:
-                            gamma_by_strike[strike_val] = 0
-                        gamma_by_strike[strike_val] += gamma * max(oi, 1) * 100
-                        call_oi_by_strike[strike_val] = call_oi_by_strike.get(strike_val, 0) + max(oi, 1)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-        # ── Calculate walls and gamma flip ───────────────────────────────────
-        put_wall = None
-        call_wall = None
-        gamma_flip = None
-
-        # Put wall = highest OI among strikes BELOW current price
-        # Call wall = highest OI among strikes ABOVE current price
-        # Without this filter, covered-call OI from prior assignments
-        # (e.g. $47-48 strikes from March stress episode) can dominate
-        # the full chain and produce a nonsensical call wall below spot.
-        if put_oi_by_strike and tqqq_price:
-            below = {s: v for s, v in put_oi_by_strike.items() if s < tqqq_price}
-            if below:
-                put_wall = round(max(below, key=below.get), 1)
-        if call_oi_by_strike and tqqq_price:
-            above = {s: v for s, v in call_oi_by_strike.items() if s > tqqq_price}
-            if above:
-                call_wall = round(max(above, key=above.get), 1)
-
-        # Gamma flip: highest strike below price where net gamma crosses from negative to positive
-        if gamma_by_strike and tqqq_price:
-            sorted_strikes = sorted(gamma_by_strike.keys())
-            below_price = [s for s in sorted_strikes if s <= tqqq_price]
-            for i in range(len(below_price) - 1, 0, -1):
-                s = below_price[i]
-                s_prev = below_price[i - 1]
-                if gamma_by_strike.get(s, 0) > 0 and gamma_by_strike.get(s_prev, 0) <= 0:
-                    gamma_flip = round((s + s_prev) / 2, 2)
-                    break
-                elif gamma_by_strike.get(s, 0) <= 0:
-                    gamma_flip = round(s, 2)
-                    break
+        # ── Compute gamma flip + walls from yfinance OI (accurate) ───────────
+        put_wall, call_wall, gamma_flip = _gex_from_yfinance(tqqq_price)
 
         return {
-            "chains": chains,
-            "put_wall": put_wall,
-            "call_wall": call_wall,
+            "chains":     chains,
+            "put_wall":   put_wall,
+            "call_wall":  call_wall,
             "gamma_flip": gamma_flip,
-            "error": None,
+            "error":      None,
         }
     except Exception as e:
         return {"error": str(e), "chains": {}}
@@ -614,7 +650,12 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
         f"REGIME:           {regime}",
         f"CONFIDENCE:       {confidence}",
         f"EXECUTION SIGNAL: {sig_label}",
-        f"RSI NOTE:         {'RSI >' + str(round(rsi,1)) + ' — EXTENDED: avoid top-end strikes, prefer lower half of zone, consider waiting for pullback' if rsi and rsi > 80 else ('RSI >' + str(round(rsi,1)) + ' — elevated, monitor' if rsi and rsi > 70 else '')}" if rsi else "",
+        f"RSI NOTE:         " + (
+            f"QQQ RSI {round(rsi,1)} > 80 — EXTENDED: tighten strikes, prefer lower zone half, wait for pullback"
+            if rsi and rsi > 80 else
+            f"QQQ RSI {round(rsi,1)} elevated — monitor momentum before adding size"
+            if rsi and rsi > 70 else ""
+        ) if rsi else "",
         "",
         "— MARKET DATA —",
         f"QQQ:         ${qqq:.2f}",
@@ -622,7 +663,9 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
         f"QQQ vs SMA:  {sign}{pct:.2f}% ({above})",
         f"VIX:         {vix:.1f} via {vix_sym}"
         + (" [CONFIRMED]" if vix_reliable else " [LOW CONFIDENCE - verify on CBOE]"),
-        f"QQQ RSI(14): {rsi if rsi else 'N/A'}",
+        f"QQQ RSI(14): {rsi if rsi else 'N/A'} (Wilder-smoothed)",
+        f"TQQQ RSI(14): {tqqq_rsi if tqqq_rsi else 'N/A'}" + (" [OVERSOLD — bullish for puts]" if tqqq_rsi and tqqq_rsi < 35 else
+   " [LOW]" if tqqq_rsi and tqqq_rsi < 45 else ""),
         "",
         "— MARKET STRUCTURE —",
         f"TQQQ Price:       ${tqqq_price:.2f}" if tqqq_price else "TQQQ Price:       N/A",
@@ -784,7 +827,8 @@ if data:
     else:
         qqq = data["qqq_price"]
         sma = data["sma200"]
-        rsi = data["rsi14"]
+        rsi       = data["rsi14"]
+        tqqq_rsi  = data.get("tqqq_rsi14")
         tqqq_price = data.get("tqqq_price")
 
         # Resolve breadth — read session_state HERE so button-press fetch is available
@@ -917,6 +961,12 @@ if data:
             ("VIX" + (" ✓" if vix_reliable else " ~"), f"{vix:.1f}", vix_color,
              vix_sym + (" confirmed" if vix_reliable else " — verify CBOE")),
             ("QQQ RSI(14)", rsi_str, rsi_color, "daily"),
+            ("TQQQ RSI(14)",
+             str(tqqq_rsi) if tqqq_rsi else "N/A",
+             "#16a34a" if tqqq_rsi and tqqq_rsi < 30 else
+             "#d97706" if tqqq_rsi and tqqq_rsi < 40 else "#0f172a",
+             "oversold" if tqqq_rsi and tqqq_rsi < 30 else
+             "low" if tqqq_rsi and tqqq_rsi < 40 else "daily"),
         ]
         if tqqq_price:
             metrics.insert(0, ("TQQQ", f"${tqqq_price:.2f}", None, None))
