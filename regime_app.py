@@ -602,7 +602,7 @@ def section_html(title, rows):
 def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
                   vix_reliable, rsi, cfg, dep_pct, dep_note, breadth,
                   gamma_above, gamma_flip, put_wall, call_wall, tqqq_price,
-                  sz_low, sz_high, et_now):
+                  sz_low, sz_high, et_now, chain_data=None):
     sign = "+" if pct >= 0 else ""
     above = "ABOVE" if pct >= 0 else "BELOW"
     on_off = lambda v: "ON" if v else "OFF"
@@ -676,6 +676,35 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
     ]
     if not vix_reliable:
         lines.append("NOTE: VIX is estimated — DO NOT use for threshold decisions. Verify on CBOE.")
+
+    # ── Append put chains if available ────────────────────────────────────────
+    if chain_data and not chain_data.get("error") and chain_data.get("chains"):
+        lines.append("")
+        lines.append("— PUT CHAINS —")
+        for exp_label, puts in chain_data.get("chains", {}).items():
+            if isinstance(puts, dict) and "error" in puts:
+                lines.append(f"{exp_label}: error loading chain")
+                continue
+            if not puts:
+                lines.append(f"{exp_label}: no data")
+                continue
+            liquid = [p for p in puts if p.get("bid", 0) > 0.05][:14]
+            if not liquid:
+                lines.append(f"{exp_label}: no liquid strikes")
+                continue
+            lines.append(f"{exp_label}:")
+            lines.append(f"  {'Strike':<8} {'Bid':>6} {'Ask':>6} {'Mid':>6} {'Delta':>7}")
+            lines.append(f"  {'-'*38}")
+            for p in liquid:
+                in_zone = sz_low and sz_high and sz_low <= p["strike"] <= sz_high
+                marker = "  ✓" if in_zone else ""
+                delta_s = f"{p['delta']:.3f}" if p.get("delta") else "  —  "
+                lines.append(
+                    f"  ${p['strike']:<7.1f} ${p['bid']:>5.2f} ${p['ask']:>5.2f}"
+                    f" ${p['mid']:>5.2f} {delta_s:>7}{marker}"
+                )
+            lines.append("")
+
     return "\n".join(lines)
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -1016,14 +1045,78 @@ if data:
         # ── Portfolio Calculator
         st.markdown("---")
         st.markdown("#### Portfolio Calculator *(optional)*")
-        st.caption("Enter account details for exact sizing.")
+
+        # Auto-select: expiry closest to 7 DTE, strike nearest zone midpoint
+        def _best_chain_strike(chain_data, sz_low, sz_high):
+            """Find (strike, premium, exp_label) closest to zone mid from 7-DTE expiry."""
+            if not chain_data or chain_data.get("error"):
+                return None, None, None
+            chains = chain_data.get("chains", {})
+            if not chains:
+                return None, None, None
+            # Pick expiry with DTE closest to 7
+            import re as _re
+            best_exp, best_dte_diff = None, 999
+            for lbl in chains:
+                m = _re.search(r"(\d+)\s*DTE", lbl)
+                if m:
+                    dte = int(m.group(1))
+                    diff = abs(dte - 7)
+                    if diff < best_dte_diff:
+                        best_dte_diff = diff
+                        best_exp = lbl
+            if not best_exp:
+                return None, None, None
+            puts = chains[best_exp]
+            if not puts or isinstance(puts, dict):
+                return None, None, None
+            liquid = [p for p in puts if p.get("bid", 0) > 0.05]
+            if not liquid:
+                return None, None, None
+            # Zone midpoint
+            if sz_low and sz_high:
+                zone_mid = (sz_low + sz_high) / 2
+            elif sz_high:
+                zone_mid = sz_high - 0.75
+            else:
+                zone_mid = None
+            if zone_mid:
+                best_put = min(liquid, key=lambda p: abs(p["strike"] - zone_mid))
+            else:
+                # Fall back: lowest delta above 0.15
+                candidates = [p for p in liquid if p.get("delta") and p["delta"] >= 0.15]
+                best_put = candidates[-1] if candidates else liquid[-1]
+            return best_put["strike"], best_put["mid"], best_exp
+
+        auto_strike, auto_prem, auto_exp = _best_chain_strike(chain_data, sz_low, sz_high)
+        default_strike = float(auto_strike) if auto_strike else 45.0
+        default_prem   = float(auto_prem)   if auto_prem   else 0.58
+
+        if auto_strike:
+            st.caption(
+                f"Auto-selected from chain: **{auto_exp}** — "
+                f"strike **${auto_strike:.1f}** (nearest zone mid ${(sz_low+sz_high)/2:.1f} "
+                f"= (${sz_low:.1f}+${sz_high:.1f})/2)" if sz_low and sz_high
+                else f"Auto-selected: {auto_exp} — strike ${auto_strike:.1f}"
+            )
+        else:
+            st.caption("Enter account details for exact sizing.")
+
         pc1, pc2 = st.columns(2)
         with pc1:
             nlv = st.number_input("Account NLV ($)", min_value=1000, value=42000, step=1000)
-            strike_input = st.number_input("Intended Strike ($)", min_value=1.0, value=45.0, step=0.5)
+            strike_input = st.number_input(
+                "Intended Strike ($)",
+                min_value=1.0, value=default_strike, step=0.5,
+                help="Auto-filled from chain — nearest strike to zone midpoint at closest-to-7-DTE expiry"
+            )
         with pc2:
             existing = st.number_input("Existing Assignment ($)", min_value=0, value=0, step=1000)
-            premium = st.number_input("Est. Premium / Contract ($)", min_value=0.01, value=0.58, step=0.01)
+            premium = st.number_input(
+                "Mid Premium / Contract ($)",
+                min_value=0.01, value=default_prem, step=0.01,
+                help="Auto-filled from chain mid price for the selected strike"
+            )
 
         if dep_pct > 0:
             max_assign = nlv * dep_pct / 100
@@ -1140,6 +1233,7 @@ if data:
             vix_reliable, rsi, cfg, dep_pct, dep_note, breadth_val,
             gamma_above, gamma_flip_val, put_wall_val, call_wall_val,
             tqqq_price, sz_low, sz_high, et_now,
+            chain_data=chain_data,
         )
         st.text_area("", value=summary, height=400, label_visibility="collapsed")
         st.success("Report generated at " + et_now.strftime("%I:%M %p ET"))
