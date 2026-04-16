@@ -157,34 +157,53 @@ def execution_signal(regime, confidence, vix_reliable):
 
 def suggested_deployment(regime, confidence, breadth):
     if regime == "TREND":
-        if confidence == "HIGH" and (breadth is None or breadth >= 55):
-            return 65, "Full cap — breadth and VIX confirmed (>55%)"
-        if breadth is not None and breadth >= 50:
-            return 55, "Near full — breadth moderate (40-55%), not yet confirmed"
-        if breadth is not None and breadth >= 40:
-            return 50, "Reduced — breadth in moderate zone, watch for >55% upgrade"
-        return 50, "Reduced — breadth not fully confirmed"
+        if breadth is None or breadth >= 55:
+            return 65, "Full Trend cap — breadth confirmed >55%"
+        if breadth >= 50:
+            return 55, "Improving — breadth 50-55%, near full but not yet confirmed"
+        if breadth >= 40:
+            return 45, "Moderate — breadth 40-50%, Tension-sized until >55%"
+        return 40, "Weak breadth (<40%) — stay conservative"
     if regime == "TENSION":
         if breadth is not None and breadth < 40:
             return 40, "Weak breadth — reduced but within Tension cap"
         return 45, "Standard Tension cap — watch breadth for Trend upgrade"
     return 0, "No bullish deployment allowed"
 
-def strike_zone(tqqq_price, put_wall, gamma_flip):
+def strike_zone(tqqq_price, put_wall, gamma_flip, rsi=None, gamma_at_flip=False):
     """
     AUTHORITATIVE strike zone — called once, used everywhere.
     Primary: sell below put wall (put wall = upper anchor, dealer support floor).
     Fallback: 3-5% OTM from current price if no put wall available.
+
+    RSI override: When daily RSI > 80, step zone down one tier (more OTM)
+    to avoid top-end strikes into momentum extension.
+    Gamma flip proximity: When price is within 0.5% of flip, step down further.
     """
     if tqqq_price is None:
         return None, None
+
+    # Determine if we should step down the zone
+    rsi_extended = rsi is not None and rsi > 80
+    flip_fragile  = gamma_at_flip  # already computed upstream
+
     if put_wall and put_wall < tqqq_price:
         sz_high = put_wall
-        sz_low = round(put_wall - 1.5, 1)
+        sz_low  = round(put_wall - 1.5, 1)
+        # RSI > 80: drop the zone by one full tier (~1.5 pts)
+        if rsi_extended:
+            sz_high = sz_low
+            sz_low  = round(sz_high - 1.5, 1)
+        # Price sitting on gamma flip: drop a half tier on top of any RSI shift
+        elif flip_fragile:
+            sz_high = round(sz_high - 0.5, 1)
+            sz_low  = round(sz_low  - 0.5, 1)
         return sz_low, sz_high
-    # Fallback
-    sz_high = round(tqqq_price * 0.97, 1)
-    sz_low = round(tqqq_price * 0.95, 1)
+
+    # Fallback — price-based
+    base_otm = 0.95 if rsi_extended else 0.97
+    sz_high = round(tqqq_price * base_otm, 1)
+    sz_low  = round(tqqq_price * (base_otm - 0.02), 1)
     return sz_low, sz_high
 
 # ── Regime config ─────────────────────────────────────────────────────────────
@@ -446,10 +465,19 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
         call_wall = None
         gamma_flip = None
 
-        if put_oi_by_strike:
-            put_wall = round(max(put_oi_by_strike, key=put_oi_by_strike.get), 1)
-        if call_oi_by_strike:
-            call_wall = round(max(call_oi_by_strike, key=call_oi_by_strike.get), 1)
+        # Put wall = highest OI among strikes BELOW current price
+        # Call wall = highest OI among strikes ABOVE current price
+        # Without this filter, covered-call OI from prior assignments
+        # (e.g. $47-48 strikes from March stress episode) can dominate
+        # the full chain and produce a nonsensical call wall below spot.
+        if put_oi_by_strike and tqqq_price:
+            below = {s: v for s, v in put_oi_by_strike.items() if s < tqqq_price}
+            if below:
+                put_wall = round(max(below, key=below.get), 1)
+        if call_oi_by_strike and tqqq_price:
+            above = {s: v for s, v in call_oi_by_strike.items() if s > tqqq_price}
+            if above:
+                call_wall = round(max(above, key=above.get), 1)
 
         # Gamma flip: highest strike below price where net gamma crosses from negative to positive
         if gamma_by_strike and tqqq_price:
@@ -586,6 +614,7 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
         f"REGIME:           {regime}",
         f"CONFIDENCE:       {confidence}",
         f"EXECUTION SIGNAL: {sig_label}",
+        f"RSI NOTE:         {'RSI >' + str(round(rsi,1)) + ' — EXTENDED: avoid top-end strikes, prefer lower half of zone, consider waiting for pullback' if rsi and rsi > 80 else ('RSI >' + str(round(rsi,1)) + ' — elevated, monitor' if rsi and rsi > 70 else '')}" if rsi else "",
         "",
         "— MARKET DATA —",
         f"QQQ:         ${qqq:.2f}",
@@ -597,10 +626,11 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
         "",
         "— MARKET STRUCTURE —",
         f"TQQQ Price:       ${tqqq_price:.2f}" if tqqq_price else "TQQQ Price:       N/A",
-        f"Gamma Regime:     {'POSITIVE (above flip)' if gamma_above else 'NEGATIVE (below flip)' if gamma_above is not None else 'Not provided'}",
+        f"Gamma Regime:     {'POSITIVE (above flip)' if gamma_above else 'NEGATIVE (below flip)' if gamma_above is not None else 'Not provided'}" + (" ⚠️ PRICE AT FLIP — cushion minimal" if (gamma_flip and tqqq_price and abs(tqqq_price - gamma_flip) / tqqq_price < 0.01) else ""),
         f"Gamma Flip:       {gamma_flip if gamma_flip else 'Not provided'}",
         f"Put Wall:         {put_wall if put_wall else 'Not provided'}",
         f"Call Wall:        {call_wall if call_wall else 'Not provided'}",
+        f"Wall Status:      {wall_warning if wall_warning else 'OK'}",
         f"Breadth (>200MA): {str(breadth) + '%' if breadth is not None else 'Not provided'}"
         + (" [WEAK]" if breadth is not None and breadth < 40 else
            " [MODERATE]" if breadth is not None and breadth < 55 else
@@ -620,8 +650,8 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
     if sz_low and sz_high:
         lines.append(f"Strike Zone:      ${sz_low:.1f} – ${sz_high:.1f} (below put wall)")
     if breadth is not None and breadth < 55 and regime in ["TENSION", "TREND"] and dep_pct < 65:
-        lines.append(f"Breadth Override:  Active — full Trend not authorized until breadth > 50%")
-        lines.append(f"                   Current breadth {breadth}% must reach 50%+ to unlock 65% deployment")
+        lines.append(f"Breadth Override:  Active — full Trend not authorized until breadth > 55%")
+        lines.append(f"                   Current breadth {breadth}% must reach 55%+ to unlock 65% deployment")
     lines += [
         "",
         "— ENGINES —",
@@ -762,13 +792,32 @@ if data:
         put_wall_val   = put_wall_manual   if put_wall_manual   else chain_put_wall
         call_wall_val  = chain_call_wall   # always auto, no manual override needed
 
+        # ── Wall structure validation ─────────────────────────────────────────
+        # Flag conditions where the auto-calculated walls are structurally invalid.
+        # These can occur when heavy covered-call OI from prior assignments
+        # dominates the chain and produces inverted or nonsensical wall values.
+        wall_warning = None
+        wall_exceeded = None   # price has blown through a wall
+        if tqqq_price and put_wall_val and call_wall_val:
+            if call_wall_val < put_wall_val:
+                wall_warning = "⚠️ STRUCTURE INVALID: Call wall below put wall — OI likely contaminated by prior-assignment covered calls. Enter walls manually from Barchart."
+            elif call_wall_val < tqqq_price:
+                wall_exceeded = f"⚠️ PRICE ABOVE CALL WALL (${call_wall_val:.1f}): Wall exceeded — not a valid anchor. Strike zone is price-based fallback only."
+            elif put_wall_val > tqqq_price:
+                wall_warning = "⚠️ STRUCTURE INVALID: Put wall above current price — data error. Enter put wall manually."
+        elif tqqq_price and put_wall_val and put_wall_val > tqqq_price:
+            wall_warning = "⚠️ STRUCTURE INVALID: Put wall above current price — data error. Enter put wall manually."
+
         # Gamma regime
         gamma_above = None
+        gamma_at_flip = False
         if gamma_flip_val and tqqq_price:
             gamma_above = tqqq_price > gamma_flip_val
+            # Within 1% of flip = mean-reversion cushion is minimal
+            gamma_at_flip = abs(tqqq_price - gamma_flip_val) / tqqq_price < 0.01
 
         # ── SINGLE strike zone calculation — used everywhere below ─────────────
-        sz_low, sz_high = strike_zone(tqqq_price, put_wall_val, gamma_flip_val)
+        sz_low, sz_high = strike_zone(tqqq_price, put_wall_val, gamma_flip_val, rsi=rsi, gamma_at_flip=gamma_at_flip)
 
         # Run regime engine
         regime, pct, confidence = determine_regime(
@@ -860,6 +909,11 @@ if data:
 
         # ── Market Structure — now uses resolved values (auto OR manual override)
         struct_rows = []
+        # Show wall structure warnings at the top of the section if invalid
+        if wall_warning:
+            struct_rows.append(row_html("⚠️ Wall Data", f"<span style='color:#dc2626;font-weight:700;font-size:0.85rem'>{wall_warning}</span>"))
+        if wall_exceeded:
+            struct_rows.append(row_html("⚠️ Wall Exceeded", f"<span style='color:#b45309;font-weight:700;font-size:0.85rem'>{wall_exceeded}</span>"))
         if tqqq_price:
             struct_rows.append(row_html("TQQQ vs Gamma Flip",
                 pill("ABOVE — positive gamma", "green") if gamma_above is True
@@ -867,7 +921,8 @@ if data:
                 else pill("Enter gamma flip or wait for chains", "gray")))
         if gamma_flip_val:
             src = "(manual)" if gamma_flip_manual else "(auto from chain)"
-            struct_rows.append(row_html("Gamma Flip", f"${gamma_flip_val:.2f} <span style='color:#94a3b8;font-size:0.75rem'>{src}</span>"))
+            flip_warning = " <span style='color:#f59e0b;font-size:0.75rem;font-weight:700'>⚠️ Price at flip — cushion minimal</span>" if gamma_at_flip else ""
+            struct_rows.append(row_html("Gamma Flip", f"${gamma_flip_val:.2f} <span style='color:#94a3b8;font-size:0.75rem'>{src}</span>{flip_warning}"))
         if put_wall_val:
             src = "(manual)" if put_wall_manual else "(auto from chain)"
             struct_rows.append(row_html("Put Wall", f"${put_wall_val:.1f} <span style='color:#94a3b8;font-size:0.75rem'>{src}</span>"))
@@ -887,6 +942,15 @@ if data:
             struct_rows.append(row_html("Suggested Strike Zone",
                 f'<span style="color:#166534;font-weight:700">${sz_low:.1f} – ${sz_high:.1f}</span>'
                 + (' <span style="color:#94a3b8;font-size:0.75rem">(below put wall)</span>' if put_wall_val else ' <span style="color:#94a3b8;font-size:0.75rem">(price-based fallback)</span>')))
+        # RSI execution override note — shown in playbook section, not regime
+        rsi_exec_note = None
+        if rsi:
+            if rsi > 80:
+                rsi_exec_note = (f"⚠️ RSI {rsi:.1f} — EXTENDED: avoid top-end strikes, "
+                                  f"prefer lower half of zone, "
+                                  f"consider waiting for pullback before entry")
+            elif rsi > 70:
+                rsi_exec_note = f"RSI {rsi:.1f} — Elevated. Monitor momentum before adding size."
         st.markdown(section_html("Market Structure", struct_rows), unsafe_allow_html=True)
 
         # ── Playbook Output
@@ -895,6 +959,15 @@ if data:
         wc_p  = pill("ELIGIBLE", "yellow") if cfg["wildcard"] else pill("NOT ELIGIBLE", "gray")
         dep_disp = f"{dep_pct}% of NLV" if dep_pct > 0 else pill("0% — no bullish deployment", "red")
         dep_note_disp = f'<span style="color:#64748b;font-size:0.78rem">{dep_note}</span>'
+        # Build RSI execution row if note exists
+        rsi_exec_rows = []
+        if rsi_exec_note:
+            rsi_color = "#dc2626" if rsi and rsi > 80 else "#d97706"
+            rsi_exec_rows.append(row_html(
+                "RSI Entry Signal",
+                f"<span style='color:{rsi_color};font-weight:700;font-size:0.83rem'>{rsi_exec_note}</span>"
+            ))
+
         st.markdown(section_html("Playbook Output", [
             row_html("Bullish CSPs", csp_p),
             row_html("Inverse Spreads", inv_p),
@@ -905,7 +978,7 @@ if data:
             row_html("Target DTE", cfg["dte"]),
             row_html("Target Delta", cfg["delta"]),
             row_html("Instrument", cfg["instrument"]),
-        ]), unsafe_allow_html=True)
+        ] + rsi_exec_rows), unsafe_allow_html=True)
 
         # ── Engine Status
         e = cfg["engines"]
