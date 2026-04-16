@@ -65,15 +65,22 @@ def calc_sma(prices, period):
     return sum(prices[-period:]) / period
 
 def calc_rsi(prices, period=14):
-    if len(prices) < period + 1:
+    # Wilder-smoothed RSI. Needs at least 2x period bars to produce a
+    # meaningful result. The old version used only the last `period` changes
+    # with a simple average — this inflated RSI dramatically after a
+    # straight-up rally (showed 84 when the correct value was ~68-71).
+    if len(prices) < period * 2:
         return None
-    gains, losses = [], []
-    for i in range(len(prices) - period, len(prices)):
-        d = prices[i] - prices[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains) / period
-    al = sum(losses) / period
+    changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains   = [max(c, 0) for c in changes]
+    losses  = [max(-c, 0) for c in changes]
+    # Seed with simple average of first `period` bars
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    # Wilder exponential smoothing over all remaining bars
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
     if al == 0:
         return 100.0
     return round(100 - 100 / (1 + ag / al), 1)
