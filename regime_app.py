@@ -384,104 +384,170 @@ def fetch_data(api_key, secret_key):
 
 
 @st.cache_data(ttl=180)
-def _gex_from_yfinance(tqqq_price):
+def _gex_from_alpaca(spot, api_key, api_secret, days_out=45):
     """
-    Compute put wall, call wall, and gamma flip using yfinance open interest.
-    yfinance provides actual OI across all expirations — much more accurate
-    than Alpaca's indicative feed which has no OI field.
-    Returns (put_wall, call_wall, gamma_flip) or (None, None, None) on failure.
-    """
-    try:
-        import yfinance as yf
-        from datetime import datetime, timezone
-        import math
+    Compute put wall, call wall, and gamma flip using the correct
+    two-endpoint Alpaca join:
 
-        t    = yf.Ticker("TQQQ")
-        exps = t.options          # all available expiration dates (strings)
-        if not exps:
+      /v2/options/contracts  → OI per contract symbol
+      /v2/options/snapshots  → live greeks per contract symbol
+
+    GEX = OI × live_gamma × spot × 100   (aggregated cross-expiry)
+
+    This matches Barchart's methodology:
+    - Uses live gamma (not BSM approximation from stale IV)
+    - Joins OI from contracts endpoint with greeks from snapshots
+    - Walls = OTM strikes with highest GEX (not highest raw OI)
+    - Gamma flip = cumulative GEX zero-crossing low→high
+
+    Returns (put_wall, call_wall, gamma_flip) or (None, None, None).
+    """
+    import urllib.request
+    import urllib.parse
+    import json
+    from datetime import datetime, timedelta
+
+    BASE_TRADE = "https://api.alpaca.markets"
+    BASE_DATA  = "https://data.alpaca.markets"
+    SYMBOL     = "TQQQ"
+    headers    = {
+        "APCA-API-KEY-ID":     api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+
+    try:
+        today    = datetime.today().date()
+        end_date = (datetime.today() + timedelta(days=days_out)).date()
+
+        # ── Step 1: Fetch OI from contracts endpoint ──────────────────────────
+        oi_map     = {}   # {contract_symbol: int}
+        page_token = None
+        for _ in range(20):   # max 20 pages
+            params = {
+                "underlying_symbols":  SYMBOL,
+                "expiration_date_gte": str(today),
+                "expiration_date_lte": str(end_date),
+                "status":              "active",
+                "limit":               1000,
+            }
+            if page_token:
+                params["page_token"] = page_token
+            url = BASE_TRADE + "/v2/options/contracts?" + urllib.parse.urlencode(params)
+            req  = urllib.request.Request(url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=30)
+            data = json.loads(resp.read())
+            for c in data.get("option_contracts", []):
+                oi = c.get("open_interest")
+                if oi is not None and int(oi) > 0:
+                    oi_map[c["symbol"]] = int(oi)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        if not oi_map:
             return None, None, None
 
-        gamma_by_strike   = {}
-        put_oi_by_strike  = {}
-        call_oi_by_strike = {}
-
-        # Use only expirations ≤45 DTE — near-term OI reflects current dealer
-        # positioning. Far-dated OI is dominated by legacy crash hedges (large
-        # put positions at $40-47 opened during March 2026 decline) and
-        # speculative recovery calls ($60+) that distort the wall calculation.
-        for exp in exps[:12]:   # scan up to 12 but filter by DTE
+        # ── Step 2: Identify unique expirations ───────────────────────────────
+        expiry_set = set()
+        for sym in oi_map:
+            # OCC format: TQQQ260417P00050000
             try:
-                dte = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days
-                if dte < 0 or dte > 45:   # skip expired AND far-dated
-                    continue
-                T = max(dte, 1) / 365.0   # time to expiry in years
-
-                chain = t.option_chain(exp)
-                calls = chain.calls
-                puts  = chain.puts
-
-                # ── Process puts ──────────────────────────────────────────────
-                for _, row in puts.iterrows():
-                    K  = float(row["strike"])
-                    oi = float(row.get("openInterest") or 0)
-                    iv = float(row.get("impliedVolatility") or 0.6)
-                    if oi == 0:
-                        continue
-                    put_oi_by_strike[K] = put_oi_by_strike.get(K, 0) + oi
-                    # BSM gamma approximation: γ = φ(d1) / (S × σ × √T)
-                    # d1 = (ln(S/K) + (σ²/2)T) / (σ√T)
-                    if iv > 0 and T > 0:
-                        d1 = (math.log(tqqq_price / K) + (iv**2 / 2) * T) / (iv * math.sqrt(T))
-                        bsm_gamma = math.exp(-0.5 * d1**2) / (math.sqrt(2 * math.pi) * tqqq_price * iv * math.sqrt(T))
-                    else:
-                        bsm_gamma = 0
-                    gamma_by_strike[K] = gamma_by_strike.get(K, 0) - bsm_gamma * oi * 100
-
-                # ── Process calls ─────────────────────────────────────────────
-                for _, row in calls.iterrows():
-                    K  = float(row["strike"])
-                    oi = float(row.get("openInterest") or 0)
-                    iv = float(row.get("impliedVolatility") or 0.6)
-                    if oi == 0:
-                        continue
-                    call_oi_by_strike[K] = call_oi_by_strike.get(K, 0) + oi
-                    if iv > 0 and T > 0:
-                        d1 = (math.log(tqqq_price / K) + (iv**2 / 2) * T) / (iv * math.sqrt(T))
-                        bsm_gamma = math.exp(-0.5 * d1**2) / (math.sqrt(2 * math.pi) * tqqq_price * iv * math.sqrt(T))
-                    else:
-                        bsm_gamma = 0
-                    gamma_by_strike[K] = gamma_by_strike.get(K, 0) + bsm_gamma * oi * 100
-
+                rest     = sym[len(SYMBOL):]
+                date_str = rest[:6]
+                expiry   = f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}"
+                expiry_set.add(expiry)
             except Exception:
                 continue
+        expirations = sorted(expiry_set)
 
-        # ── Walls ─────────────────────────────────────────────────────────────
-        put_wall  = None
-        call_wall = None
-        if put_oi_by_strike:
-            below = {s: v for s, v in put_oi_by_strike.items() if s < tqqq_price}
-            if below:
-                put_wall = round(max(below, key=below.get), 1)
-        if call_oi_by_strike:
-            above = {s: v for s, v in call_oi_by_strike.items() if s > tqqq_price}
-            if above:
-                call_wall = round(max(above, key=above.get), 1)
+        # ── Step 3: Fetch live greeks per expiry, join with OI ────────────────
+        # GEX accumulators per strike
+        gex = {}   # {strike: {"net": 0, "call": 0, "put": 0}}
 
-        # ── Gamma flip: sweep down from ATM looking for net GEX sign change ──
-        gamma_flip = None
-        if gamma_by_strike:
-            strikes_below = sorted([s for s in gamma_by_strike if s <= tqqq_price])
-            for i in range(len(strikes_below) - 1, 0, -1):
-                s      = strikes_below[i]
-                s_prev = strikes_below[i - 1]
-                gs     = gamma_by_strike.get(s, 0)
-                gs_prev= gamma_by_strike.get(s_prev, 0)
-                if gs > 0 and gs_prev <= 0:
-                    gamma_flip = round((s + s_prev) / 2, 2)
+        strike_lo = round(spot * 0.60)   # ±40% of spot
+        strike_hi = round(spot * 1.40)
+
+        for expiry in expirations:
+            snaps      = {}
+            page_token = None
+            for _ in range(10):
+                params = {
+                    "underlying_symbol": SYMBOL,
+                    "expiration_date":   expiry,
+                    "strike_price_gte":  strike_lo,
+                    "strike_price_lte":  strike_hi,
+                    "limit":             1000,
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                url  = BASE_DATA + "/v2/options/snapshots?" + urllib.parse.urlencode(params)
+                req  = urllib.request.Request(url, headers=headers)
+                resp = urllib.request.urlopen(req, timeout=30)
+                data = json.loads(resp.read())
+                snaps.update(data.get("snapshots", {}))
+                page_token = data.get("next_page_token")
+                if not page_token:
                     break
-                elif gs <= 0:
-                    gamma_flip = round(s, 2)
-                    break
+
+            for contract_sym, snap in snaps.items():
+                oi = oi_map.get(contract_sym, 0)
+                if oi <= 0:
+                    continue
+                greeks = snap.get("greeks") or {}
+                gamma  = greeks.get("gamma")
+                if not gamma or gamma <= 0:
+                    continue
+                # Parse strike and type from OCC symbol
+                try:
+                    rest   = contract_sym[len(SYMBOL):]
+                    cp     = rest[6]          # C or P
+                    strike = float(rest[7:]) / 1000.0
+                except Exception:
+                    continue
+                contract_gex = oi * gamma * spot * 100
+                if strike not in gex:
+                    gex[strike] = {"net": 0.0, "call": 0.0, "put": 0.0}
+                if cp == "C":
+                    gex[strike]["call"] += contract_gex
+                    gex[strike]["net"]  += contract_gex
+                else:
+                    gex[strike]["put"]  += contract_gex
+                    gex[strike]["net"]  -= contract_gex
+
+        if not gex:
+            return None, None, None
+
+        # ── Step 4: Gamma flip (cumulative zero-crossing, low → high) ─────────
+        sorted_strikes = sorted(gex)
+        cumulative     = 0.0
+        gamma_flip     = None
+        prev_k, prev_cum = None, 0.0
+        for K in sorted_strikes:
+            prev_cum    = cumulative
+            cumulative += gex[K]["net"]
+            if prev_k is not None and prev_cum * cumulative < 0:
+                if abs(cumulative - prev_cum) > 0:
+                    t          = abs(prev_cum) / abs(cumulative - prev_cum)
+                    gamma_flip = round(prev_k + t * (K - prev_k), 2)
+                else:
+                    gamma_flip = K
+                break
+            prev_k = K
+        # Fallback: strike where cumulative is closest to zero
+        if gamma_flip is None:
+            cum, best = 0.0, (float("inf"), sorted_strikes[0])
+            for K in sorted_strikes:
+                cum += gex[K]["net"]
+                if abs(cum) < best[0]:
+                    best = (abs(cum), K)
+            gamma_flip = best[1]
+
+        # ── Step 5: Walls (OTM, highest GEX) ─────────────────────────────────
+        otm_put_gex  = {K: v["put"]  for K, v in gex.items() if K < spot and v["put"]  > 0}
+        otm_call_gex = {K: v["call"] for K, v in gex.items() if K > spot and v["call"] > 0}
+
+        put_wall  = round(max(otm_put_gex,  key=otm_put_gex.get),  1) if otm_put_gex  else None
+        call_wall = round(max(otm_call_gex, key=otm_call_gex.get), 1) if otm_call_gex else None
 
         return put_wall, call_wall, gamma_flip
 
@@ -492,7 +558,8 @@ def _gex_from_yfinance(tqqq_price):
 def fetch_option_chains(api_key, secret_key, tqqq_price):
     """
     Fetch TQQQ option chains for display (Alpaca — live bid/ask/mid/delta)
-    and compute gamma flip + walls from yfinance OI data (more accurate).
+    and compute gamma flip + walls using the correct two-endpoint Alpaca join
+    (contracts API for OI + snapshots API for live greeks).
     Returns: {chains, put_wall, call_wall, gamma_flip, error}
     """
     try:
@@ -547,7 +614,7 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
                 chains[label] = {"error": str(ex)}
 
         # ── Compute gamma flip + walls from yfinance OI (accurate) ───────────
-        put_wall, call_wall, gamma_flip = _gex_from_yfinance(tqqq_price)
+        put_wall, call_wall, gamma_flip = _gex_from_alpaca(tqqq_price, api_key, secret_key)
 
         return {
             "chains":     chains,
