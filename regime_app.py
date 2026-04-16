@@ -388,11 +388,14 @@ def _gex_from_yfinance(tqqq_price):
         put_oi_by_strike  = {}
         call_oi_by_strike = {}
 
-        # Use up to 8 nearest expirations — captures bulk of GEX
-        for exp in exps[:8]:
+        # Use only expirations ≤45 DTE — near-term OI reflects current dealer
+        # positioning. Far-dated OI is dominated by legacy crash hedges (large
+        # put positions at $40-47 opened during March 2026 decline) and
+        # speculative recovery calls ($60+) that distort the wall calculation.
+        for exp in exps[:12]:   # scan up to 12 but filter by DTE
             try:
                 dte = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days
-                if dte < 0:
+                if dte < 0 or dte > 45:   # skip expired AND far-dated
                     continue
                 T = max(dte, 1) / 365.0   # time to expiry in years
 
@@ -677,7 +680,9 @@ def build_summary(regime, confidence, sig_label, qqq, sma, pct, vix, vix_sym,
         f"Breadth (>200MA): {str(breadth) + '%' if breadth is not None else 'Not provided'}"
         + (" [WEAK]" if breadth is not None and breadth < 40 else
            " [MODERATE]" if breadth is not None and breadth < 55 else
-           " [STRONG]" if breadth is not None else ""),
+           " [STRONG]" if breadth is not None else "")
+        + (" — NOTE: auto from NDX100; $NAA200R (StockCharts) reads ~7pp lower in narrow-leadership markets"
+           if breadth is not None and breadth_source and "NDX100" in breadth_source else ""),
         "",
         "— PLAYBOOK OUTPUT —",
         f"Bullish CSPs:     {'ALLOWED' if cfg['bullish_csp'] else 'NOT ALLOWED'}",
@@ -840,7 +845,7 @@ if data:
             breadth_source = "manual override"
         elif auto_breadth is not None:
             breadth_val = auto_breadth
-            breadth_source = f"auto (NDX100): {breadth_note_auto}"
+            breadth_source = f"auto (NDX100): {breadth_note_auto} — $NAA200R runs ~7pp lower"
         else:
             breadth_val = None
 
