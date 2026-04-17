@@ -389,6 +389,32 @@ def fetch_data(api_key, secret_key):
         return {"error": str(e)}
 
 
+def _snap_vol(snap):
+    """
+    Extract the best available volume proxy from an Alpaca option snapshot.
+    Tries every known SDK attribute path and falls back to 1 (unweighted)
+    so GEX always has a signal even on illiquid strikes.
+
+    Attribute paths tried (SDK maps camelCase JSON → snake_case Python):
+      snap.prev_daily_bar.volume  ← prevDailyBar.v  (yesterday vol — best proxy)
+      snap.daily_bar.volume       ← dailyBar.v       (today vol so far)
+      snap.prev_daily_bar.trade_count  (n field)
+    """
+    for path in [
+        lambda s: s.prev_daily_bar.volume,
+        lambda s: s.daily_bar.volume,
+        lambda s: s.prev_daily_bar.trade_count,
+        lambda s: s.daily_bar.trade_count,
+    ]:
+        try:
+            v = path(snap)
+            if v and v > 0:
+                return int(v)
+        except Exception:
+            continue
+    return 1   # unweighted fallback — gamma still contributes to GEX shape
+
+
 def fetch_option_chains(api_key, secret_key, tqqq_price):
     """
     Fetch TQQQ option chains (display) and compute GEX levels.
@@ -454,15 +480,14 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
                         bid = snap.latest_quote.bid_price if snap.latest_quote else 0
                         ask = snap.latest_quote.ask_price if snap.latest_quote else 0
                         mid = round((bid + ask) / 2, 2)
-                        delta = gamma = vol = None
+                        delta = gamma = None
                         if snap.greeks:
                             delta = round(abs(snap.greeks.delta), 3)
                             gamma = snap.greeks.gamma
-                        # OI proxy: use prev day volume (best available without OI endpoint)
-                        if snap.prev_daily_bar:
-                            vol = snap.prev_daily_bar.volume or 0
+                        # Robust volume extraction — SDK attribute names vary
+                        vol = _snap_vol(snap)
                         # Accumulate GEX
-                        if gamma and gamma > 0 and vol and vol > 0:
+                        if gamma and gamma > 0 and vol > 0:
                             g = vol * gamma * tqqq_price * 100
                             if strike_val not in gex:
                                 gex[strike_val] = {"net": 0.0, "call": 0.0, "put": 0.0}
@@ -497,12 +522,11 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
                 for sym, snap in chain.items():
                     try:
                         strike_val = int(sym[-8:]) / 1000
-                        gamma = vol = None
+                        gamma = None
                         if snap.greeks:
                             gamma = snap.greeks.gamma
-                        if snap.prev_daily_bar:
-                            vol = snap.prev_daily_bar.volume or 0
-                        if gamma and gamma > 0 and vol and vol > 0:
+                        vol = _snap_vol(snap)
+                        if gamma and gamma > 0 and vol > 0:
                             g = vol * gamma * tqqq_price * 100
                             if strike_val not in gex:
                                 gex[strike_val] = {"net": 0.0, "call": 0.0, "put": 0.0}
