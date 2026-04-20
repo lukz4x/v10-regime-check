@@ -417,16 +417,12 @@ def _snap_vol(snap):
 
 def fetch_option_chains(api_key, secret_key, tqqq_price):
     """
-    Fetch TQQQ option chains (display) and compute GEX levels.
+    Fetch TQQQ option chains for display and compute GEX levels.
 
-    Both done in a single pass using OptionHistoricalDataClient which we know
-    works. GEX is computed from the same chain data using prevDailyBar.v
-    (yesterday's volume) as the OI proxy — no separate OI endpoint needed.
-    This avoids the TradingClient paper/live routing issue entirely.
-
-    Fetches:
-      - Two display expirations (nearest Fridays) — puts only for the table
-      - Up to 6 expirations (puts + calls) for GEX across ≤45 DTE
+    Chain display: two nearest Fridays, puts only, original strike range.
+    GEX: separate pass, puts + calls, up to 6 Fridays ≤45 DTE.
+    Both use OptionHistoricalDataClient which is confirmed working.
+    Kept separate so a GEX failure cannot break chain display.
 
     Returns: {chains, put_wall, call_wall, gamma_flip, error}
     """
@@ -439,39 +435,26 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
         client = OptionHistoricalDataClient(api_key, secret_key)
         today  = date.today()
 
-        # ── Expirations: next 6 Fridays ≤45 DTE ──────────────────────────────
-        def next_fridays(n=6):
-            exps = []
-            d = today
-            while len(exps) < n:
-                d += timedelta(days=1)
-                if d.weekday() == 4:  # Friday
-                    dte = (d - today).days
-                    if dte <= 45:
-                        exps.append(d)
-                    else:
-                        break
-            return exps
-
-        all_exps     = next_fridays(6)
-        display_exps = all_exps[:2]   # first two for the chain table
-        gex_exps     = all_exps       # all for GEX
+        # Next two Fridays for chain display
+        days_ahead = (4 - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        next_friday  = today + timedelta(days=days_ahead)
+        friday_after = next_friday + timedelta(days=7)
 
         chains = {}
-        gex    = {}   # {strike: {"net": 0.0, "call": 0.0, "put": 0.0}}
 
-        # ── Fetch puts for display + GEX (all expirations) ───────────────────
-        for exp in gex_exps:
-            label      = f"{exp.strftime('%b %d')} ({(exp - today).days} DTE)"
-            is_display = exp in display_exps
-            puts       = []
+        # ── Chain display — exactly as the working version ────────────────────
+        for exp in [next_friday, friday_after]:
+            label = f"{exp.strftime('%b %d')} ({(exp - today).days} DTE)"
+            puts  = []
             try:
                 req = OptionChainRequest(
                     underlying_symbol="TQQQ",
                     type=ContractType.PUT,
                     expiration_date=str(exp),
-                    strike_price_gte=tqqq_price * 0.70,
-                    strike_price_lte=tqqq_price * 1.10,
+                    strike_price_gte=tqqq_price * 0.82,
+                    strike_price_lte=tqqq_price * 1.05,
                 )
                 chain = client.get_option_chain(req)
                 for sym, snap in chain.items():
@@ -480,92 +463,95 @@ def fetch_option_chains(api_key, secret_key, tqqq_price):
                         bid = snap.latest_quote.bid_price if snap.latest_quote else 0
                         ask = snap.latest_quote.ask_price if snap.latest_quote else 0
                         mid = round((bid + ask) / 2, 2)
-                        delta = gamma = None
+                        delta = None
                         if snap.greeks:
                             delta = round(abs(snap.greeks.delta), 3)
-                            gamma = snap.greeks.gamma
-                        # Robust volume extraction — SDK attribute names vary
-                        vol = _snap_vol(snap)
-                        # Accumulate GEX
-                        if gamma and gamma > 0 and vol > 0:
-                            g = vol * gamma * tqqq_price * 100
-                            if strike_val not in gex:
-                                gex[strike_val] = {"net": 0.0, "call": 0.0, "put": 0.0}
-                            gex[strike_val]["put"]  += g
-                            gex[strike_val]["net"]  -= g  # puts subtract
-                        # Display table (only for display exps, only liquid strikes)
-                        if is_display and bid > 0.05:
+                        if bid > 0.05:
                             puts.append({
                                 "strike": strike_val, "bid": round(bid, 2),
                                 "ask":    round(ask, 2), "mid": mid, "delta": delta,
                             })
                     except Exception:
                         continue
-                if is_display:
-                    puts.sort(key=lambda x: x["strike"], reverse=True)
-                    chains[label] = puts
+                puts.sort(key=lambda x: x["strike"], reverse=True)
+                chains[label] = puts
             except Exception as ex:
-                if is_display:
-                    chains[label] = {"error": str(ex)}
+                chains[label] = {"error": str(ex)}
 
-        # ── Fetch calls for GEX only (all expirations) ────────────────────────
-        for exp in gex_exps:
-            try:
-                req = OptionChainRequest(
-                    underlying_symbol="TQQQ",
-                    type=ContractType.CALL,
-                    expiration_date=str(exp),
-                    strike_price_gte=tqqq_price * 0.70,
-                    strike_price_lte=tqqq_price * 1.40,
-                )
-                chain = client.get_option_chain(req)
-                for sym, snap in chain.items():
+        # ── GEX — separate pass, up to 6 Fridays ≤45 DTE ─────────────────────
+        put_wall = call_wall = gamma_flip = None
+        try:
+            gex  = {}
+            exps = []
+            d    = today
+            while len(exps) < 6:
+                d += timedelta(days=1)
+                if d.weekday() == 4 and (d - today).days <= 45:
+                    exps.append(d)
+                elif (d - today).days > 45:
+                    break
+
+            for exp in exps:
+                for ctype in [ContractType.PUT, ContractType.CALL]:
                     try:
-                        strike_val = int(sym[-8:]) / 1000
-                        gamma = None
-                        if snap.greeks:
-                            gamma = snap.greeks.gamma
-                        vol = _snap_vol(snap)
-                        if gamma and gamma > 0 and vol > 0:
-                            g = vol * gamma * tqqq_price * 100
-                            if strike_val not in gex:
-                                gex[strike_val] = {"net": 0.0, "call": 0.0, "put": 0.0}
-                            gex[strike_val]["call"] += g
-                            gex[strike_val]["net"]  += g  # calls add
+                        req = OptionChainRequest(
+                            underlying_symbol="TQQQ",
+                            type=ctype,
+                            expiration_date=str(exp),
+                            strike_price_gte=tqqq_price * 0.75,
+                            strike_price_lte=tqqq_price * 1.35,
+                        )
+                        chain = client.get_option_chain(req)
+                        for sym, snap in chain.items():
+                            try:
+                                strike_val = int(sym[-8:]) / 1000
+                                if not snap.greeks or not snap.greeks.gamma:
+                                    continue
+                                gamma = snap.greeks.gamma
+                                if gamma <= 0:
+                                    continue
+                                vol = _snap_vol(snap)
+                                g   = vol * gamma * tqqq_price * 100
+                                if strike_val not in gex:
+                                    gex[strike_val] = {"net": 0.0, "call": 0.0, "put": 0.0}
+                                if ctype == ContractType.CALL:
+                                    gex[strike_val]["call"] += g
+                                    gex[strike_val]["net"]  += g
+                                else:
+                                    gex[strike_val]["put"]  += g
+                                    gex[strike_val]["net"]  -= g
+                            except Exception:
+                                continue
                     except Exception:
                         continue
-            except Exception:
-                continue
 
-        # ── Compute gamma flip, put wall, call wall from GEX profile ─────────
-        put_wall = call_wall = gamma_flip = None
-        if gex:
-            sorted_k = sorted(gex)
-
-            # Gamma flip: cumulative GEX zero-crossing low→high
-            cum = 0.0
-            prev_k = prev_cum = None
-            for K in sorted_k:
-                prev_cum = cum
-                cum += gex[K]["net"]
-                if prev_k is not None and prev_cum is not None and prev_cum * cum < 0:
-                    t = abs(prev_cum) / abs(cum - prev_cum) if abs(cum - prev_cum) > 0 else 0
-                    gamma_flip = round(prev_k + t * (K - prev_k), 2)
-                    break
-                prev_k = K
-            if gamma_flip is None:  # fallback
-                cum2, best = 0.0, (float("inf"), sorted_k[0])
-                for K in sorted_k:
-                    cum2 += gex[K]["net"]
-                    if abs(cum2) < best[0]:
-                        best = (abs(cum2), K)
-                gamma_flip = best[1]
-
-            # Walls: OTM strike with max GEX
-            otm_put  = {K: v["put"]  for K, v in gex.items() if K < tqqq_price and v["put"]  > 0}
-            otm_call = {K: v["call"] for K, v in gex.items() if K > tqqq_price and v["call"] > 0}
-            if otm_put:  put_wall  = round(max(otm_put,  key=otm_put.get),  1)
-            if otm_call: call_wall = round(max(otm_call, key=otm_call.get), 1)
+            if gex:
+                sk = sorted(gex)
+                # Gamma flip
+                cum = prev_k = prev_cum = None
+                cum = 0.0
+                for K in sk:
+                    prev_cum = cum
+                    cum += gex[K]["net"]
+                    if prev_k is not None and prev_cum * cum < 0:
+                        t = abs(prev_cum) / abs(cum - prev_cum) if abs(cum - prev_cum) > 0 else 0
+                        gamma_flip = round(prev_k + t * (K - prev_k), 2)
+                        break
+                    prev_k = K
+                if gamma_flip is None:
+                    c2, best = 0.0, (float("inf"), sk[0])
+                    for K in sk:
+                        c2 += gex[K]["net"]
+                        if abs(c2) < best[0]:
+                            best = (abs(c2), K)
+                    gamma_flip = best[1]
+                # Walls
+                op = {K: v["put"]  for K, v in gex.items() if K < tqqq_price and v["put"]  > 0}
+                oc = {K: v["call"] for K, v in gex.items() if K > tqqq_price and v["call"] > 0}
+                if op: put_wall  = round(max(op, key=op.get), 1)
+                if oc: call_wall = round(max(oc, key=oc.get), 1)
+        except Exception:
+            pass  # GEX failure never breaks chain display
 
         return {
             "chains":     chains,
@@ -805,38 +791,52 @@ if not api_key or not secret_key:
         secret_key = st.text_input("Alpaca Secret Key", type="password")
         st.caption("Add to Streamlit Secrets to avoid entering every time.")
 
-st.markdown("#### Manual Inputs")
-st.caption("Breadth auto-computed from NDX100 vs 200MA on Run. Override below only if needed. Gamma/walls and VIX auto-fetched.")
+st.markdown("#### Inputs")
 
+# Barchart gamma values — PRIMARY source (auto-GEX is unreliable)
+st.caption("📊 **Barchart gamma values** — enter these from barchart.com/etfs-funds/quotes/TQQQ/gamma-exposure before running. Auto-GEX is a rough approximation only.")
+bc1, bc2, bc3 = st.columns(3)
+with bc1:
+    gamma_flip_raw = st.number_input(
+        "Gamma Flip (Barchart)", min_value=0.0,
+        value=None, step=0.5, placeholder="e.g. 46.84",
+        help="From Barchart TQQQ gamma exposure page. Primary source."
+    )
+with bc2:
+    put_wall_raw = st.number_input(
+        "Put Wall (Barchart)", min_value=0.0,
+        value=None, step=0.5, placeholder="e.g. 50.0",
+        help="From Barchart TQQQ gamma exposure page."
+    )
+with bc3:
+    call_wall_raw = st.number_input(
+        "Call Wall (Barchart)", min_value=0.0,
+        value=None, step=0.5, placeholder="e.g. 57.0",
+        help="From Barchart TQQQ gamma exposure page."
+    )
+
+st.caption("📈 **Breadth & VIX** — breadth auto-computed from NDX100 on Run (reads ~7pp above StockCharts $NAA200R). Enter $NAA200R value below to use canonical breadth.")
 col1, col2 = st.columns(2)
 with col1:
     breadth_raw = st.number_input(
-        "% Stocks Above 200MA", min_value=0, max_value=100,
-        value=None, step=1, placeholder="e.g. 39"
-    )
-    vix_manual_raw = st.number_input(
-        "VIX override (optional)", min_value=0.0,
-        value=None, step=0.1, placeholder="Auto-fetched",
-        help="Leave blank to use auto-fetched VIX. Enter manually only to override."
+        "Breadth — $NAA200R % (StockCharts)", min_value=0, max_value=100,
+        value=None, step=1, placeholder="e.g. 42  (leave blank = use NDX100 auto)",
+        help="StockCharts $NAA200R. Preferred over NDX100 auto — reads ~7pp lower but is the canonical source."
     )
 with col2:
-    gamma_flip_raw = st.number_input(
-        "Gamma Flip override", min_value=0.0,
-        value=None, step=0.5, placeholder="Auto-calculated",
-        help="Leave blank — calculated from option chain. Override if you have Barchart value."
-    )
-    put_wall_raw = st.number_input(
-        "Put Wall override", min_value=0.0,
-        value=None, step=0.5, placeholder="Auto-calculated",
-        help="Leave blank — calculated from option chain OI."
+    vix_manual_raw = st.number_input(
+        "VIX override (optional)", min_value=0.0,
+        value=None, step=0.1, placeholder="Auto-fetched from ^VIX",
+        help="Leave blank — auto-fetched from Yahoo Finance. Enter only if auto is wrong."
     )
 
 # Manual override only here — auto_breadth resolved inside display block
 breadth_val_manual = int(breadth_raw) if breadth_raw and breadth_raw > 0 else None
 
 gamma_flip_manual = float(gamma_flip_raw) if gamma_flip_raw and gamma_flip_raw > 0 else None
-put_wall_manual = float(put_wall_raw) if put_wall_raw and put_wall_raw > 0 else None
-vix_manual_val = float(vix_manual_raw) if vix_manual_raw and vix_manual_raw > 0 else None
+put_wall_manual   = float(put_wall_raw)   if put_wall_raw   and put_wall_raw   > 0 else None
+call_wall_manual  = float(call_wall_raw)  if call_wall_raw  and call_wall_raw  > 0 else None
+vix_manual_val    = float(vix_manual_raw) if vix_manual_raw and vix_manual_raw > 0 else None
 
 # ── Button: fetch BOTH market data AND chains together ────────────────────────
 if st.button("Run Regime Check", type="primary"):
@@ -880,7 +880,9 @@ if data:
             breadth_source = "manual override"
         elif auto_breadth is not None:
             breadth_val = auto_breadth
-            breadth_source = f"auto (NDX100): {breadth_note_auto} — $NAA200R runs ~7pp lower"
+            breadth_source = f"auto (NDX100): {breadth_note_auto}"
+            # Canonical breadth = NDX100 - 7pp adjustment (NAA200R equivalent)
+            canonical_breadth = max(0, breadth_val - 7)
         else:
             breadth_val = None
 
@@ -901,25 +903,36 @@ if data:
         chain_call_wall = chain_data.get("call_wall") if chain_data and not chain_data.get("error") else None
         chain_gamma_flip= chain_data.get("gamma_flip")if chain_data and not chain_data.get("error") else None
 
+        # Manual (Barchart) always wins. Auto-GEX is fallback only.
         gamma_flip_val = gamma_flip_manual if gamma_flip_manual else chain_gamma_flip
         put_wall_val   = put_wall_manual   if put_wall_manual   else chain_put_wall
-        call_wall_val  = chain_call_wall   # always auto, no manual override needed
+        call_wall_val  = call_wall_manual  if call_wall_manual  else chain_call_wall
 
         # ── Wall structure validation ─────────────────────────────────────────
-        # Flag conditions where the auto-calculated walls are structurally invalid.
-        # These can occur when heavy covered-call OI from prior assignments
-        # dominates the chain and produces inverted or nonsensical wall values.
-        wall_warning = None
-        wall_exceeded = None   # price has blown through a wall
+        wall_warning  = None
+        wall_exceeded = None
+        walls_are_manual = bool(gamma_flip_manual or put_wall_manual or call_wall_manual)
+
         if tqqq_price and put_wall_val and call_wall_val:
             if call_wall_val < put_wall_val:
-                wall_warning = "⚠️ STRUCTURE INVALID: Call wall below put wall — OI likely contaminated by prior-assignment covered calls. Enter walls manually from Barchart."
-            elif call_wall_val < tqqq_price:
-                wall_exceeded = f"⚠️ PRICE ABOVE CALL WALL (${call_wall_val:.1f}): Wall exceeded — not a valid anchor. Strike zone is price-based fallback only."
+                wall_warning = "⚠️ STRUCTURE INVALID: Call wall below put wall — auto-GEX contaminated. Enter Barchart values above."
             elif put_wall_val > tqqq_price:
-                wall_warning = "⚠️ STRUCTURE INVALID: Put wall above current price — data error. Enter put wall manually."
+                wall_warning = "⚠️ STRUCTURE INVALID: Put wall above current price — auto-GEX error. Enter Barchart values above."
+            elif call_wall_val < tqqq_price:
+                wall_exceeded = f"⚠️ PRICE AT/ABOVE CALL WALL (${call_wall_val:.1f}): Resistance level reached. Do not add aggressive bullish exposure here."
+            # Auto-GEX plausibility check: if flip > spot, auto values are wrong
+            if not walls_are_manual and gamma_flip_val and gamma_flip_val > tqqq_price:
+                wall_warning = (
+                    f"⚠️ AUTO-GEX UNRELIABLE: Computed gamma flip (${gamma_flip_val:.2f}) is above "
+                    f"current price (${tqqq_price:.2f}) — volume-proxy GEX is distorted. "
+                    f"Enter Barchart values in the inputs above for accurate structure data."
+                )
+                # Reset auto values so strike zone falls back to price-based
+                gamma_flip_val = None
+                put_wall_val   = put_wall_manual   # keep manual if set
+                call_wall_val  = call_wall_manual
         elif tqqq_price and put_wall_val and put_wall_val > tqqq_price:
-            wall_warning = "⚠️ STRUCTURE INVALID: Put wall above current price — data error. Enter put wall manually."
+            wall_warning = "⚠️ STRUCTURE INVALID: Put wall above current price — enter Barchart values."
 
         # Gamma regime
         gamma_above = None
@@ -938,7 +951,10 @@ if data:
         )
         cfg = REGIMES[regime]
         sig_label, sig_color, sig_note = execution_signal(regime, confidence, vix_reliable)
-        dep_pct, dep_note = suggested_deployment(regime, confidence, breadth_val)
+        # Deployment uses canonical breadth: manual ($NAA200R) as-is, auto NDX100 minus 7pp
+        is_manual_breadth = breadth_val_manual is not None
+        canonical_breadth_for_dep = breadth_val if (breadth_val is None or is_manual_breadth) else max(0, breadth_val - 7)
+        dep_pct, dep_note = suggested_deployment(regime, confidence, canonical_breadth_for_dep)
         above = qqq > sma
         sign = "+" if pct >= 0 else ""
 
@@ -1046,13 +1062,22 @@ if data:
             src = "(manual)" if put_wall_manual else "(auto from chain)"
             struct_rows.append(row_html("Put Wall", f"${put_wall_val:.1f} <span style='color:#94a3b8;font-size:0.75rem'>{src}</span>"))
         if call_wall_val:
-            struct_rows.append(row_html("Call Wall", f"${call_wall_val:.1f} <span style='color:#94a3b8;font-size:0.75rem'>(auto from chain)</span>"))
+            cw_src = "(Barchart)" if call_wall_manual else "(auto from chain)"
+            struct_rows.append(row_html("Call Wall", f"${call_wall_val:.1f} <span style='color:#94a3b8;font-size:0.75rem'>{cw_src}</span>"))
         if breadth_val is not None:
-            b_style = "green" if breadth_val >= 55 else "yellow" if breadth_val >= 40 else "red"
-            b_label = "STRONG" if breadth_val >= 55 else "MODERATE" if breadth_val >= 40 else "WEAK"
-            src_tag = f'<span style="color:#94a3b8;font-size:0.72rem;margin-left:6px">({breadth_source})</span>'
+            # Use canonical breadth for classification — if manual ($NAA200R) use as-is,
+            # if auto (NDX100) subtract 7pp to get canonical equivalent
+            is_manual_breadth = breadth_val_manual is not None
+            if is_manual_breadth:
+                canonical_b = breadth_val
+                breadth_display = f"{breadth_val}% ($NAA200R)"
+            else:
+                canonical_b = max(0, breadth_val - 7)
+                breadth_display = f"{breadth_val}% NDX100 / ~{canonical_b}% canonical ($NAA200R est.)"
+            b_style = "green" if canonical_b >= 55 else "yellow" if canonical_b >= 40 else "red"
+            b_label = "STRONG" if canonical_b >= 55 else "MODERATE" if canonical_b >= 40 else "WEAK"
             struct_rows.append(row_html("Breadth (% > 200MA)",
-                f'{pill(b_label, b_style)} <span style="margin-left:6px">{breadth_val}%</span>{src_tag}'))
+                f'{pill(b_label, b_style)} <span style="margin-left:6px">{breadth_display}</span>'))
         else:
             err_note = st.session_state.get("breadth_note", "run check to fetch")
             struct_rows.append(row_html("Breadth (% > 200MA)",
