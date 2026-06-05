@@ -302,19 +302,27 @@ sma30 = last["sma30"]
 sma200 = last["sma200"]
 sma30_rising = last["sma30"] > last["sma30_lagged"]
 
-# Build a narrative paragraph
+# Compute price-level translations of the percentage thresholds
+trigger_price = sma200 * (1 + z_thresh / 100)        # price at which extension == z_threshold
+primary_release_price = sma200                        # price at which extension == 0
 distance_to_threshold = z_thresh - ext
+distance_to_trigger_pct = (trigger_price / close - 1) * 100
+
+# Streamlit markdown treats `$...$` as LaTeX math. Escape every dollar sign.
+def esc(s: str) -> str:
+    return s.replace("$", r"\$")
 
 narrative_lines = []
-narrative_lines.append(
-    f"**TQQQ closed at ${close:.2f}**, which is **{ext:+.2f}%** above its 200-day average (${sma200:.2f})."
-)
+narrative_lines.append(esc(
+    f"**TQQQ closed at ${close:.2f}**, which is **{ext:+.2f}%** above its 200-day average of "
+    f"**${sma200:.2f}**."
+))
 
 if eff_locked:
-    narrative_lines.append(
-        f"The lockout is currently **active** — it fired on {state['last_trigger_date']} "
+    narrative_lines.append(esc(
+        f"The lockout is **active** — it fired on {state['last_trigger_date']} "
         f"when extension crossed the z-threshold. You're on day **{eff_days}** of lockout."
-    )
+    ))
     release_ready = (
         eff_days >= MIN_DAYS_LOCKED
         and sma30_rising
@@ -322,10 +330,10 @@ if eff_locked:
         and ext < z_thresh
     )
     if release_ready:
-        narrative_lines.append(
+        narrative_lines.append(esc(
             f"✅ **All 4 release conditions are met today.** The lockout releases — "
             f"buy back in at vol-target weight tomorrow at the open."
-        )
+        ))
     else:
         blockers = []
         if eff_days < MIN_DAYS_LOCKED:
@@ -335,23 +343,30 @@ if eff_locked:
         if close <= sma30:
             blockers.append(f"price (${close:.2f}) isn't above SMA30 (${sma30:.2f})")
         if ext >= z_thresh:
-            blockers.append(f"extension ({ext:+.2f}%) isn't yet below z-threshold ({z_thresh:+.2f}%)")
-        narrative_lines.append(
+            blockers.append(
+                f"extension ({ext:+.2f}%) hasn't dropped below the z-threshold yet — "
+                f"need TQQQ to close below ${trigger_price:.2f}"
+            )
+        narrative_lines.append(esc(
             f"Release is **blocked** because: {'; '.join(blockers)}. Stay in cash tomorrow."
-        )
+        ))
 else:
     if ext >= z_thresh:
-        narrative_lines.append(
+        narrative_lines.append(esc(
             f"⚠️ **The lockout fires today** — extension ({ext:+.2f}%) "
-            f"has crossed the z-threshold ({z_thresh:+.2f}%). Sell to cash tomorrow at the open."
-        )
+            f"crossed the z-threshold ({z_thresh:+.2f}%). Sell to cash tomorrow at the open."
+        ))
     else:
         target = min(VOL_TARGET / rv20, 1.0)
-        narrative_lines.append(
-            f"No lockout — extension ({ext:+.2f}%) is **{distance_to_threshold:.2f}pp below** the "
-            f"z-threshold ({z_thresh:+.2f}%). With RV20 at {rv20:.2f}%, "
-            f"target weight = min(50 / {rv20:.2f}, 1.0) = **{target*100:.1f}%**."
-        )
+        narrative_lines.append(esc(
+            f"**No lockout today** — extension ({ext:+.2f}%) is **{distance_to_threshold:.2f}pp below** "
+            f"the z-threshold ({z_thresh:+.2f}%). The lockout would fire if TQQQ closed at or above "
+            f"**${trigger_price:.2f}** "
+            f"(that's {distance_to_trigger_pct:+.1f}% from today's close)."
+        ))
+        narrative_lines.append(esc(
+            f"With RV20 at {rv20:.2f}%, target weight = min(50 / {rv20:.2f}, 1.0) = **{target*100:.1f}%**."
+        ))
 
 for line in narrative_lines:
     st.markdown(line)
@@ -363,7 +378,7 @@ st.header("📊 Indicators — what each one means")
 
 st.markdown("**Risk indicators (these decide whether the lockout fires)**")
 
-r1c1, r1c2, r1c3 = st.columns(3)
+r1c1, r1c2, r1c3, r1c4 = st.columns(4)
 r1c1.metric(
     "Extension",
     f"{ext:+.2f}%",
@@ -374,18 +389,30 @@ r1c1.metric(
     )
 )
 r1c2.metric(
-    "Z-threshold",
+    "Z-threshold (%)",
     f"{z_thresh:+.2f}%",
     delta=f"ext is {ext - z_thresh:+.2f}pp from trigger",
     delta_color="inverse" if ext < z_thresh else "normal",
     help=(
-        "The dynamic lockout trigger level. "
+        "The dynamic lockout trigger level, expressed as a percentage extension. "
         "Formula: rolling 2-year mean of extension + 2 × rolling 2-year stdev of extension. "
-        "When today's extension reaches this level, the lockout fires and we sell to cash. "
-        "Today's threshold means TQQQ is statistically extremely over-extended."
+        "When today's extension reaches this level, the lockout fires and we sell to cash."
     )
 )
 r1c3.metric(
+    "Lockout fire price",
+    f"${trigger_price:.2f}",
+    delta=f"{distance_to_trigger_pct:+.1f}% from today's close",
+    delta_color="off",
+    help=(
+        "The actual TQQQ price level at which the lockout fires. "
+        "Formula: SMA200 × (1 + z_threshold / 100). "
+        "If TQQQ closes at or above this price, the lockout activates and we go to cash. "
+        "If you're already locked, this is also the price below which the 'ext < threshold' "
+        "release condition gets satisfied."
+    )
+)
+r1c4.metric(
     "Z-score",
     f"{z_score:+.2f}σ",
     help=(
@@ -561,10 +588,10 @@ if in_band and shares_to_trade == 0 and not new_locked:
 
 if action_weight > 0:
     stop_price = close * (1 - STOP_PCT)
-    st.info(
+    st.info(esc(
         f"🛡️ **Stop order**: After your buy fills, place a stop-MARKET sell at **${stop_price:.2f}** "
         f"(8% below today's close). Cancel at 3:55 PM ET — intraday only, not GTC."
-    )
+    ))
 
 st.divider()
 
