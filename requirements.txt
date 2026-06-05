@@ -2,3 +2,5 @@ streamlit>=1.32.0
 alpaca-py>=0.26.0
 pytz
 yfinance>=0.2.54
+pandas>=2.0.0
+numpy>=1.24.0
