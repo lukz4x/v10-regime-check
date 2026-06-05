@@ -1,385 +1,340 @@
-#!/usr/bin/env python3
 """
-TQQQ D_rising_sma30 Daily Decision Helper (Yahoo Finance edition)
-=================================================================
+TQQQ D_rising_sma30 Daily Decision Helper — Streamlit App
+==========================================================
 
-Companion script to the D_rising_sma30 Implementation Manual.
+Deploys to Streamlit Community Cloud (streamlit.io).
 
-What it does:
-  1. Fetches TQQQ history from Yahoo Finance (~5 years of daily bars)
-  2. Computes all strategy indicators from the full history
-  3. Asks you for your current position (lockout state, NLV, shares)
-  4. Applies the decision tree and outputs tomorrow's action
+Run locally:
+    pip install -r requirements.txt
+    streamlit run streamlit_app.py
 
-Usage:
-    python tqqq_daily_decision.py
-
-    # Use a different ticker for testing (e.g. paper-trade on a substitute)
-    python tqqq_daily_decision.py --ticker TQQQ
-
-    # Fall back to a local CSV if Yahoo is unreachable
-    python tqqq_daily_decision.py --csv path/to/tqqq_history.csv
-
-Dependencies:
-    pip install yfinance pandas numpy
-
-Note: yfinance pulls the most-recent bar based on whatever Yahoo has cached.
-During market hours, that "today" bar may be an intraday snapshot rather than
-an official close. Run this script AFTER 4:00 PM ET to make sure today's
-close is final.
+Strategy:
+    Long-only TQQQ position, vol-targeted at min(50 / RV20, 1.0),
+    with z-score lockout trigger and SMA30 momentum re-entry.
 """
 
-import argparse
-import os
-import sys
-from datetime import date, timedelta
-import pandas as pd
+import math
+from datetime import date, datetime
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
 
 # ============================================================================
-# CONFIGURATION (these mirror the strategy spec — do not change without a reason)
+# STRATEGY CONFIGURATION
 # ============================================================================
 DEFAULT_TICKER = "TQQQ"
-LOOKBACK_PERIOD = "5y"   # Yahoo period string; 5y gives ~1260 trading days
+LOOKBACK_PERIOD = "5y"
 
-VOL_TARGET = 50.0          # Vol target divisor: target_weight = min(50 / RV20, 1.0)
-Z_LOOKBACK = 504           # Trading days (~2 years) for z-score rolling stats
-SMA200_PERIOD = 200        # Long-term moving average for extension
-SMA30_PERIOD = 30          # Momentum re-entry MA
-SMA30_LAGGED_DAYS = 5      # "5 days ago" lag for momentum check
-MIN_DAYS_LOCKED = 5        # Lockout must persist this long before momentum release
-HIGH60_PERIOD = 60         # 60-day high for diagnostics
-STOP_PCT = 0.08            # 8% same-day crash stop
-REBALANCE_BAND = 0.02      # 2 percentage point rebalance band
-Z_MULTIPLIER = 2.0         # Z-threshold = mean + 2 stdev
+VOL_TARGET = 50.0
+Z_LOOKBACK = 504
+SMA200_PERIOD = 200
+SMA30_PERIOD = 30
+SMA30_LAGGED_DAYS = 5
+MIN_DAYS_LOCKED = 5
+HIGH60_PERIOD = 60
+STOP_PCT = 0.08
+REBALANCE_BAND = 0.02
+Z_MULTIPLIER = 2.0
 
 
 # ============================================================================
-# DATA FETCHING
+# DATA + INDICATORS
 # ============================================================================
-
-def fetch_from_yahoo(ticker, period=LOOKBACK_PERIOD):
-    """
-    Fetch daily adjusted close data from Yahoo Finance.
-    Returns a DataFrame with 'date' and 'close' columns.
-    """
-    try:
-        import yfinance as yf
-    except ImportError:
-        print("ERROR: yfinance is not installed. Run:  pip install yfinance")
-        sys.exit(1)
-
-    print(f"Fetching {ticker} history from Yahoo Finance (period={period})...")
-    try:
-        # auto_adjust=True returns split-and-dividend-adjusted prices in 'Close'.
-        # Use Ticker.history() to get flat (non-MultiIndex) columns for a single ticker.
-        df = yf.Ticker(ticker).history(period=period, auto_adjust=True, actions=False)
-    except Exception as e:
-        print(f"ERROR fetching from Yahoo: {type(e).__name__}: {e}")
-        sys.exit(1)
-
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_history(ticker: str, period: str) -> pd.DataFrame:
+    """Fetch daily adjusted closes from Yahoo Finance. Cached for 1 hour."""
+    df = yf.Ticker(ticker).history(period=period, auto_adjust=True, actions=False)
     if df is None or df.empty:
-        print(f"ERROR: Yahoo returned no data for {ticker}. Try again later or use --csv fallback.")
-        sys.exit(1)
-
+        raise RuntimeError(f"Yahoo returned no data for {ticker}")
     df = df.reset_index()
-    # Normalize column names (yfinance may return 'Date' or 'Datetime')
     df.columns = [str(c).strip() for c in df.columns]
-    date_col = next((c for c in df.columns if c.lower() in ('date', 'datetime', 'index')), None)
-    close_col = next((c for c in df.columns if c.lower() == 'close'), None)
+    date_col = next((c for c in df.columns if c.lower() in ("date", "datetime", "index")), None)
+    close_col = next((c for c in df.columns if c.lower() == "close"), None)
     if not date_col or not close_col:
-        print(f"ERROR: Unexpected Yahoo response. Columns: {list(df.columns)}")
-        sys.exit(1)
-
-    df = df[[date_col, close_col]].copy()
-    df.columns = ['date', 'close']
-    df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    df = df.dropna().sort_values('date').reset_index(drop=True)
-    df = df.drop_duplicates(subset=['date'], keep='last')
-    return df
+        raise RuntimeError(f"Unexpected Yahoo response. Columns: {list(df.columns)}")
+    out = df[[date_col, close_col]].copy()
+    out.columns = ["date", "close"]
+    out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.normalize()
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna().sort_values("date").reset_index(drop=True)
+    out = out.drop_duplicates(subset=["date"], keep="last")
+    return out
 
 
-def load_from_csv(csv_path):
-    """Fallback: load history from local CSV. Same format as the Yahoo data."""
-    if not os.path.exists(csv_path):
-        print(f"ERROR: CSV not found at {csv_path}")
-        sys.exit(1)
-    df = pd.read_csv(csv_path)
-    df.columns = [c.strip() for c in df.columns]
-    date_col = next((c for c in df.columns if c.upper() in ('DATE', 'TIMESTAMP', 'TIME', 'T')), None)
-    close_col = next((c for c in df.columns if c.upper() in ('TQQQ', 'CLOSE', 'PRICE', 'C')), None)
-    if not date_col or not close_col:
-        print(f"ERROR: CSV needs DATE and CLOSE (or TQQQ) columns. Found: {list(df.columns)}")
-        sys.exit(1)
-    df = df[[date_col, close_col]].copy()
-    df.columns = ['date', 'close']
-    df['date'] = pd.to_datetime(df['date']).dt.normalize()
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    df = df.dropna().sort_values('date').reset_index(drop=True)
-    df = df.drop_duplicates(subset=['date'], keep='last')
-    return df
-
-
-# ============================================================================
-# INDICATOR COMPUTATION
-# ============================================================================
-
-def compute_indicators(df):
-    """Compute all strategy indicators on a price series."""
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    d['ret'] = d['close'].pct_change()
-    d['rv20'] = d['ret'].rolling(20).std(ddof=1) * np.sqrt(252) * 100
-    d['sma30'] = d['close'].rolling(SMA30_PERIOD).mean()
-    d['sma30_lagged'] = d['sma30'].shift(SMA30_LAGGED_DAYS)
-    d['sma200'] = d['close'].rolling(SMA200_PERIOD).mean()
-    d['ext'] = (d['close'] / d['sma200'] - 1) * 100
-    d['high60'] = d['close'].rolling(HIGH60_PERIOD).max()
-    d['new_high'] = d['close'] >= 0.999 * d['high60']
-    d['ext_mean_504'] = d['ext'].rolling(Z_LOOKBACK).mean()
-    d['ext_std_504'] = d['ext'].rolling(Z_LOOKBACK).std(ddof=1)
-    d['z_threshold'] = d['ext_mean_504'] + Z_MULTIPLIER * d['ext_std_504']
-    d['z_score'] = (d['ext'] - d['ext_mean_504']) / d['ext_std_504']
+    d["ret"] = d["close"].pct_change()
+    d["rv20"] = d["ret"].rolling(20).std(ddof=1) * np.sqrt(252) * 100
+    d["sma30"] = d["close"].rolling(SMA30_PERIOD).mean()
+    d["sma30_lagged"] = d["sma30"].shift(SMA30_LAGGED_DAYS)
+    d["sma200"] = d["close"].rolling(SMA200_PERIOD).mean()
+    d["ext"] = (d["close"] / d["sma200"] - 1) * 100
+    d["high60"] = d["close"].rolling(HIGH60_PERIOD).max()
+    d["new_high"] = d["close"] >= 0.999 * d["high60"]
+    d["ext_mean_504"] = d["ext"].rolling(Z_LOOKBACK).mean()
+    d["ext_std_504"] = d["ext"].rolling(Z_LOOKBACK).std(ddof=1)
+    d["z_threshold"] = d["ext_mean_504"] + Z_MULTIPLIER * d["ext_std_504"]
+    d["z_score"] = (d["ext"] - d["ext_mean_504"]) / d["ext_std_504"]
     return d
 
 
 # ============================================================================
-# USER STATE PROMPT
+# DECISION TREE
 # ============================================================================
-
-def prompt_state():
-    """Ask the user for the state they recorded yesterday."""
-    print("\n" + "=" * 64)
-    print(" CURRENT STATE — what you tracked yesterday")
-    print("=" * 64)
-
-    locked = input("Are you currently in lockout? [y/N]: ").strip().lower() == 'y'
-
-    days_locked = 0
-    if locked:
-        while True:
-            try:
-                days_locked = int(input("Days already in lockout (integer): "))
-                if days_locked < 0:
-                    print("Must be non-negative.")
-                    continue
-                break
-            except ValueError:
-                print("Invalid integer, try again.")
-
-    while True:
-        try:
-            raw = input("Current account NLV ($): ").strip().replace('$', '').replace(',', '')
-            nlv = float(raw)
-            break
-        except ValueError:
-            print("Invalid number, try again.")
-
-    while True:
-        try:
-            raw = input("Current TQQQ shares (0 if in cash): ").strip().replace(',', '')
-            shares = float(raw)
-            break
-        except ValueError:
-            print("Invalid number, try again.")
-
-    return {'locked': locked, 'days_locked': days_locked, 'nlv': nlv, 'shares': shares}
-
-
-# ============================================================================
-# DECISION TREE — D_rising_sma30
-# ============================================================================
-
-def make_decision(row, state):
-    """
-    Apply the D_rising_sma30 state machine using today's close indicators.
-
-    Returns:
-        (new_locked, new_days_locked, target_weight, notes)
-    """
-    rv20 = row['rv20']
-    ext = row['ext']
-    sma30 = row['sma30']
-    sma30_lagged = row['sma30_lagged']
-    z_thresh = row['z_threshold']
-    close = row['close']
-
-    locked = state['locked']
-    days_locked = state['days_locked']
+def make_decision(row: pd.Series, locked: bool, days_locked: int):
+    """Apply D_rising_sma30 state machine. Returns (new_locked, new_days, target_weight, notes)."""
+    rv20 = row["rv20"]
+    ext = row["ext"]
+    sma30 = row["sma30"]
+    sma30_lagged = row["sma30_lagged"]
+    z_thresh = row["z_threshold"]
+    close = row["close"]
     notes = []
 
     if not locked:
         if ext >= z_thresh:
-            locked = True
-            days_locked = 0
-            notes.append(f"LOCKOUT TRIGGER: ext +{ext:.2f}% >= z_threshold +{z_thresh:.2f}%")
-            target = 0.0
-        else:
-            target = min(VOL_TARGET / rv20, 1.0) if rv20 > 0 else 0.0
-            notes.append(f"No lockout. Vol-target = min(50 / {rv20:.2f}, 1.0) = {target:.3f}")
-    else:
-        days_locked += 1
-        notes.append(f"Already locked. Day {days_locked} of lockout.")
+            return True, 0, 0.0, [
+                f"LOCKOUT TRIGGER: extension {ext:+.2f}% ≥ z-threshold {z_thresh:+.2f}%"
+            ]
+        target = min(VOL_TARGET / rv20, 1.0) if rv20 > 0 else 0.0
+        return False, 0, target, [
+            f"Engaged. Vol-target = min(50 / {rv20:.2f}, 1.0) = {target:.3f}"
+        ]
 
-        # Primary release (ext returns to/below SMA200)
-        if ext <= 0:
-            locked = False
-            days_locked = 0
-            target = min(VOL_TARGET / rv20, 1.0) if rv20 > 0 else 0.0
-            notes.append(f"PRIMARY RELEASE: ext {ext:.2f}% <= 0. Re-engage at vol-target = {target:.3f}.")
-        # Momentum release (D_rising_sma30)
-        elif (days_locked >= MIN_DAYS_LOCKED
-              and sma30 > sma30_lagged
-              and close > sma30
-              and ext < z_thresh):
-            locked = False
-            days_locked = 0
-            target = min(VOL_TARGET / rv20, 1.0) if rv20 > 0 else 0.0
-            notes.append(
-                f"MOMENTUM RELEASE: SMA30 rising AND price > SMA30 AND ext < threshold. "
-                f"Re-engage at vol-target = {target:.3f}."
-            )
-        else:
-            target = 0.0
-            blocks = []
-            if days_locked < MIN_DAYS_LOCKED:
-                blocks.append(f"days_locked < {MIN_DAYS_LOCKED} (have {days_locked})")
-            if sma30 <= sma30_lagged:
-                blocks.append(f"SMA30 not rising (${sma30:.2f} vs ${sma30_lagged:.2f} 5d ago)")
-            if close <= sma30:
-                blocks.append(f"price not > SMA30 (${close:.2f} vs ${sma30:.2f})")
-            if ext >= z_thresh:
-                blocks.append(f"ext not < threshold (+{ext:.2f}% vs +{z_thresh:.2f}%)")
-            notes.append(f"NO RELEASE — blocked by: {'; '.join(blocks)}")
+    # Already locked
+    days_locked += 1
+    notes.append(f"Already locked. Day {days_locked} of lockout.")
 
-    return locked, days_locked, target, notes
+    # Primary release
+    if ext <= 0:
+        target = min(VOL_TARGET / rv20, 1.0) if rv20 > 0 else 0.0
+        notes.append(f"PRIMARY RELEASE: ext {ext:.2f}% ≤ 0. Re-engage at vol-target = {target:.3f}.")
+        return False, 0, target, notes
+
+    # Momentum release
+    if (days_locked >= MIN_DAYS_LOCKED
+            and sma30 > sma30_lagged
+            and close > sma30
+            and ext < z_thresh):
+        target = min(VOL_TARGET / rv20, 1.0) if rv20 > 0 else 0.0
+        notes.append(
+            f"MOMENTUM RELEASE: SMA30 rising, price > SMA30, ext < threshold. "
+            f"Re-engage at vol-target = {target:.3f}."
+        )
+        return False, 0, target, notes
+
+    # Still locked — explain why
+    blocks = []
+    if days_locked < MIN_DAYS_LOCKED:
+        blocks.append(f"days_locked < {MIN_DAYS_LOCKED} (have {days_locked})")
+    if sma30 <= sma30_lagged:
+        blocks.append(f"SMA30 not rising (${sma30:.2f} vs ${sma30_lagged:.2f} 5d ago)")
+    if close <= sma30:
+        blocks.append(f"price not > SMA30 (${close:.2f} vs ${sma30:.2f})")
+    if ext >= z_thresh:
+        blocks.append(f"ext not < threshold ({ext:+.2f}% vs {z_thresh:+.2f}%)")
+    notes.append("NO RELEASE — blocked by: " + "; ".join(blocks))
+    return True, days_locked, 0.0, notes
 
 
 # ============================================================================
-# MAIN
+# UI
 # ============================================================================
+st.set_page_config(
+    page_title="TQQQ D_rising_sma30",
+    page_icon="📈",
+    layout="wide"
+)
 
-def main():
-    parser = argparse.ArgumentParser(description="TQQQ D_rising_sma30 daily decision helper")
-    parser.add_argument('--ticker', default=DEFAULT_TICKER,
-                        help="Ticker to fetch (default: TQQQ)")
-    parser.add_argument('--csv', default=None,
-                        help="Fallback: path to a local CSV with DATE and CLOSE columns")
-    parser.add_argument('--period', default=LOOKBACK_PERIOD,
-                        help="Yahoo lookback period (default: 5y)")
-    args = parser.parse_args()
+st.title("📈 TQQQ D_rising_sma30 Daily Decision")
+st.caption(
+    "Volatility-targeted long TQQQ with z-score lockout, SMA30 momentum re-entry, "
+    "and 8% same-day crash stop."
+)
 
-    print("\n" + "=" * 64)
-    print(" D_rising_sma30 Daily Decision Helper")
-    print(" TQQQ paper-trade operational tool")
-    print("=" * 64)
+# Sidebar controls
+with st.sidebar:
+    st.header("Settings")
+    ticker = st.text_input("Ticker", value=DEFAULT_TICKER).strip().upper()
+    period = st.selectbox("History lookback", ["5y", "10y", "max"], index=0)
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
+    st.divider()
+    st.caption(
+        "Data: Yahoo Finance via yfinance. Cache TTL: 1 hour. "
+        "Run after 4 PM ET so today's close is final."
+    )
 
-    if args.csv:
-        print(f"\nLoading {args.ticker} history from CSV: {args.csv}")
-        df = load_from_csv(args.csv)
-    else:
-        df = fetch_from_yahoo(args.ticker, period=args.period)
+# Fetch
+try:
+    with st.spinner(f"Fetching {ticker} history..."):
+        df = fetch_history(ticker, period)
+except Exception as e:
+    st.error(f"Failed to fetch {ticker}: {e}")
+    st.stop()
 
-    print(f"Loaded {len(df)} bars from {df['date'].iloc[0].date()} "
-          f"to {df['date'].iloc[-1].date()}.")
+d = compute_indicators(df)
+last = d.iloc[-1]
 
-    # Warn if last bar isn't very recent
-    last_date = df['date'].iloc[-1].date()
-    today = date.today()
-    gap = (today - last_date).days
-    if gap > 4:
-        print(f"\nWARNING: Last bar is {gap} calendar days old "
-              f"(last: {last_date}, today: {today}).")
-        print("Yahoo may not have updated yet, or you're running before market close.")
-        ans = input("Proceed with this data? [y/N]: ").strip().lower()
-        if ans != 'y':
-            sys.exit(0)
-    elif gap == 0:
-        print(f"Today's bar is present (good — run this script AFTER 4 PM ET to be safe).")
+if pd.isna(last["ext_mean_504"]):
+    st.error(
+        f"Not enough history for 504-day rolling stats. "
+        f"Need ~{SMA200_PERIOD + Z_LOOKBACK} bars; have {len(d)}. "
+        f"Try a longer lookback."
+    )
+    st.stop()
 
-    d = compute_indicators(df)
-    last = d.iloc[-1]
+# Date freshness warning
+last_date = last["date"].date()
+today = date.today()
+gap_days = (today - last_date).days
+if gap_days > 4:
+    st.warning(
+        f"Last bar is {gap_days} calendar days old (last: {last_date}, today: {today}). "
+        f"Yahoo may not have updated, or you're running on a weekend/holiday."
+    )
 
-    if pd.isna(last['ext_mean_504']):
-        print(f"\nWARNING: Not enough history for 504-day rolling stats.")
-        print(f"Need at least {SMA200_PERIOD + Z_LOOKBACK} bars. Have {len(d)}.")
-        print(f"Increase --period (e.g. --period 10y) or extend the CSV history.")
-        sys.exit(1)
+st.subheader(f"Market indicators — {last_date}")
 
-    # Show today's indicators
-    print(f"\n=== Indicators at {last['date'].date()} close ===")
-    print(f"  Close            ${last['close']:.2f}")
-    print(f"  RV20             {last['rv20']:.2f}%")
-    print(f"  SMA30            ${last['sma30']:.2f}")
-    print(f"  SMA30 (5d ago)   ${last['sma30_lagged']:.2f}   "
-          f"(rising? {'YES' if last['sma30'] > last['sma30_lagged'] else 'NO'})")
-    print(f"  SMA200           ${last['sma200']:.2f}")
-    print(f"  Extension        {last['ext']:+.2f}%")
-    print(f"  60-day high      ${last['high60']:.2f}   "
-          f"(at new high? {'YES' if last['new_high'] else 'NO'})")
-    print(f"  Z-threshold      {last['z_threshold']:+.2f}%")
-    print(f"  Z-score          {last['z_score']:+.2f} sigma")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Close", f"${last['close']:.2f}")
+c2.metric("RV20", f"{last['rv20']:.2f}%")
+c3.metric("Extension", f"{last['ext']:+.2f}%")
+c4.metric("Z-score", f"{last['z_score']:+.2f}σ")
 
-    # Prompt state
-    state = prompt_state()
+c5, c6, c7, c8 = st.columns(4)
+c5.metric("SMA30", f"${last['sma30']:.2f}",
+          delta=f"{'rising' if last['sma30'] > last['sma30_lagged'] else 'falling'} vs 5d ago",
+          delta_color="normal")
+c6.metric("SMA200", f"${last['sma200']:.2f}")
+c7.metric("Z-threshold", f"{last['z_threshold']:+.2f}%",
+          delta=f"{last['ext'] - last['z_threshold']:+.2f}pp from ext",
+          delta_color="inverse")
+c8.metric("60d high", f"${last['high60']:.2f}",
+          delta="at new high" if last['new_high'] else "below high",
+          delta_color="off")
 
-    # Apply decision tree
-    new_locked, new_days, target, notes = make_decision(last, state)
+# Chart of extension vs z_threshold over the last 2 years
+with st.expander("📊 Extension vs Z-threshold history", expanded=False):
+    chart_df = d[["date", "ext", "z_threshold"]].dropna().tail(504).set_index("date")
+    chart_df.columns = ["Extension %", "Z-threshold %"]
+    st.line_chart(chart_df)
+    st.caption(
+        "When the blue line (extension) crosses above the orange line (z-threshold), "
+        "the lockout fires."
+    )
 
-    # Compute action
-    nlv = state['nlv']
-    cur_shares = state['shares']
-    cur_value = cur_shares * last['close']
-    cur_weight = cur_value / nlv if nlv > 0 else 0.0
+st.divider()
 
-    if abs(target - cur_weight) < REBALANCE_BAND:
-        action_weight = cur_weight
-        rebalance_note = f"Within {REBALANCE_BAND*100:.0f}pp rebalance band — no trade."
-    else:
-        action_weight = target
-        rebalance_note = "Outside rebalance band — trade required."
+# State input
+st.subheader("Your current position")
+sc1, sc2, sc3, sc4 = st.columns([1, 1, 1, 1])
+with sc1:
+    locked = st.checkbox("Currently in lockout?", value=False)
+with sc2:
+    days_locked = st.number_input(
+        "Days already locked", min_value=0, max_value=500, value=0, step=1,
+        disabled=not locked,
+        help="The count of trading days since the lockout fired (set to 0 if not locked)."
+    )
+with sc3:
+    nlv = st.number_input("Account NLV ($)", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
+with sc4:
+    shares = st.number_input("Current TQQQ shares", min_value=0, value=0, step=1)
 
-    target_value = nlv * action_weight
-    target_shares = int(target_value / last['close'])
-    shares_to_trade = target_shares - int(cur_shares)
+st.divider()
 
-    # Output
-    print(f"\n" + "=" * 64)
-    print(f" DECISION (action for next trading day)")
-    print(f"=" * 64)
-    for n in notes:
-        print(f"  - {n}")
+# Decision
+new_locked, new_days, target, notes = make_decision(
+    last,
+    locked=locked,
+    days_locked=int(days_locked)
+)
 
-    print(f"\n  New lockout state:    {'LOCKED' if new_locked else 'ENGAGED'}")
-    if new_locked:
-        print(f"  Days locked tomorrow: {new_days}")
-    print(f"  Target weight:        {action_weight*100:.1f}%")
-    print(f"  Current weight:       {cur_weight*100:.1f}%")
-    print(f"  {rebalance_note}")
+cur_value = shares * last["close"]
+cur_weight = cur_value / nlv if nlv > 0 else 0.0
 
-    if shares_to_trade != 0:
-        side = "BUY" if shares_to_trade > 0 else "SELL"
-        print(f"\n  ACTION: {side} {abs(shares_to_trade)} shares of "
-              f"{args.ticker} at next open (MOO).")
-        print(f"          Target position: {target_shares} shares "
-              f"(~${target_value:,.0f} at today's close).")
-    else:
-        print(f"\n  ACTION: No trade. Hold {int(cur_shares)} shares.")
+if abs(target - cur_weight) < REBALANCE_BAND:
+    action_weight = cur_weight
+    in_band = True
+else:
+    action_weight = target
+    in_band = False
 
-    if action_weight > 0:
-        stop_price = last['close'] * (1 - STOP_PCT)
-        print(f"\n  STOP: After your fill, place a stop-MARKET sell at ${stop_price:.2f}")
-        print(f"        (8% below today's close; cancel at 3:55 PM ET each day).")
+target_value = nlv * action_weight
+target_shares = int(target_value / last["close"])
+shares_to_trade = target_shares - int(shares)
 
-    # Memo for tomorrow
-    print(f"\n=== Record this for tomorrow's session ===")
-    print(f"  Date executed:      {last['date'].date()}")
-    print(f"  Locked:             {new_locked}")
-    print(f"  Days locked:        {new_days}")
-    print(f"  Target weight:      {action_weight*100:.1f}%")
-    print(f"  Shares (after fill): {target_shares}")
-    print()
+st.subheader("Decision")
 
+# Big colored card with the headline action
+if new_locked and shares_to_trade == 0 and shares == 0:
+    st.error(f"🔒 **LOCKED** — Hold cash. Day {new_days} of lockout.")
+elif new_locked and shares > 0:
+    st.error(f"🔒 **LOCKED — SELL {abs(shares_to_trade)} shares at next open (MOO).** Lockout active.")
+elif not new_locked and shares_to_trade > 0:
+    st.success(
+        f"🟢 **ENGAGED — BUY {abs(shares_to_trade)} shares at next open (MOO).** "
+        f"Target weight {target*100:.1f}%."
+    )
+elif not new_locked and shares_to_trade < 0:
+    st.warning(
+        f"🟡 **ENGAGED — SELL {abs(shares_to_trade)} shares to rebalance.** "
+        f"Target weight {target*100:.1f}%."
+    )
+else:
+    st.info(f"⚪ **HOLD** — No trade needed. Target {target*100:.1f}% ≈ current {cur_weight*100:.1f}%.")
 
-if __name__ == '__main__':
-    main()
+# Detailed breakdown
+dc1, dc2, dc3 = st.columns(3)
+dc1.metric("Target weight (tomorrow)", f"{action_weight*100:.1f}%",
+           delta=f"{(action_weight - cur_weight)*100:+.1f}pp")
+dc2.metric("Current weight", f"{cur_weight*100:.1f}%",
+           delta=f"${cur_value:,.0f} position")
+dc3.metric("Lockout state (after today)",
+           "LOCKED" if new_locked else "ENGAGED",
+           delta=f"day {new_days}" if new_locked else None,
+           delta_color="off")
+
+# Notes / reasoning
+st.markdown("**Decision tree evaluation:**")
+for n in notes:
+    st.markdown(f"- {n}")
+
+if in_band and shares_to_trade == 0:
+    st.caption(f"💡 Within {REBALANCE_BAND*100:.0f}pp rebalance band — no trade required.")
+
+# Stop price
+if action_weight > 0:
+    stop_price = last["close"] * (1 - STOP_PCT)
+    st.info(
+        f"🛡️ **Stop order**: After your buy fills, place a **stop-MARKET sell at "
+        f"${stop_price:.2f}** (8% below today's close). Cancel at 3:55 PM ET — intraday only."
+    )
+
+st.divider()
+
+# What to record
+with st.expander("📝 State to record for tomorrow's session", expanded=False):
+    record = pd.DataFrame([{
+        "Date executed": str(last_date),
+        "Close": f"${last['close']:.2f}",
+        "RV20 %": f"{last['rv20']:.2f}",
+        "Ext %": f"{last['ext']:+.2f}",
+        "Z-threshold %": f"{last['z_threshold']:+.2f}",
+        "Z-score σ": f"{last['z_score']:+.2f}",
+        "Locked tomorrow": new_locked,
+        "Days locked tomorrow": new_days,
+        "Target weight %": f"{action_weight*100:.1f}",
+        "Shares after fill": target_shares,
+    }])
+    st.dataframe(record.T.rename(columns={0: "value"}), use_container_width=True)
+
+# Footer
+st.caption(
+    f"📉 Strategy: D_rising_sma30. Data through {last_date}. "
+    f"Cached fetch refreshes every 60 min — use ⟳ Refresh in the sidebar to force-reload."
+)
