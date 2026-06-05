@@ -90,6 +90,20 @@ def fetch_alpaca_snapshot(ticker: str, _api_key: str, _api_secret: str, feed: st
     return data[ticker]
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_alpaca_clock(_api_key: str, _api_secret: str) -> dict:
+    """US market clock from Alpaca. Cached for 30 seconds."""
+    url = "https://paper-api.alpaca.markets/v2/clock"
+    headers = {
+        "APCA-API-KEY-ID": _api_key,
+        "APCA-API-SECRET-KEY": _api_secret,
+        "accept": "application/json",
+    }
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
 def get_alpaca_credentials():
     """Try to load Alpaca credentials from Streamlit secrets. Returns (key, secret) or (None, None)."""
     try:
@@ -308,8 +322,33 @@ if pd.isna(last["ext_mean_504"]):
     )
     st.stop()
 
-# --- TOP: Live price banner ---
+# --- TOP: Market status + Live price banner ---
 st.header("💰 Current price")
+
+# Market clock — strong intraday warning
+market_is_open = None
+market_clock_note = ""
+if api_key and api_secret:
+    try:
+        clock = fetch_alpaca_clock(api_key, api_secret)
+        market_is_open = bool(clock.get("is_open"))
+        next_event_iso = clock.get("next_close") if market_is_open else clock.get("next_open")
+        if next_event_iso:
+            next_event = datetime.fromisoformat(next_event_iso.replace("Z", "+00:00"))
+            label = "closes" if market_is_open else "opens"
+            market_clock_note = f"Market {label} at {next_event.astimezone().strftime('%H:%M %Z on %a %b %d')}."
+    except Exception:
+        pass
+
+if market_is_open is True:
+    st.warning(
+        "⏰ **Market is OPEN — this is a preliminary preview, not the final decision.** "
+        "Indicators below assume the live price IS today's close. The actual close may differ "
+        f"as TQQQ moves over the rest of the session. {market_clock_note} "
+        "Re-run after 4:00 PM ET for the official action."
+    )
+elif market_is_open is False:
+    st.success(f"🔒 **Market is CLOSED — today's close is final.** {market_clock_note}")
 
 intraday_change_pct = (live_price / prev_close - 1) * 100 if prev_close else 0.0
 
@@ -440,6 +479,62 @@ else:
 
 for line in narrative_lines:
     st.markdown(line)
+
+# --- Knife-catching diagnostics ---
+release_ready_now = (eff_locked and eff_days >= MIN_DAYS_LOCKED and sma30_rising
+                     and close > sma30 and ext < z_thresh)
+
+if release_ready_now:
+    st.divider()
+    st.subheader("🔪 Knife-catching diagnostics")
+    st.markdown(esc(
+        "The release fires, but a release isn't proof the bottom is in. "
+        "Here's the context for evaluating knife risk:"
+    ))
+
+    # Recent peak context
+    recent_window = d.tail(60)
+    recent_peak = recent_window["close"].max()
+    recent_peak_date = recent_window.loc[recent_window["close"].idxmax(), "date"].date()
+    drawdown_from_peak = (close / recent_peak - 1) * 100
+    days_since_peak = (last["date"].date() - recent_peak_date).days
+
+    # Vulnerability prices — what close levels would break each release condition?
+    # Condition 3: price > SMA30  ⇒ vulnerable below SMA30
+    price_vuln = sma30
+    # Condition 4: ext < z_threshold  ⇒ vulnerable above trigger_price (which is already shown)
+
+    kc1, kc2, kc3 = st.columns(3)
+    kc1.metric(
+        "Drawdown from 60d peak",
+        f"{drawdown_from_peak:+.2f}%",
+        delta=f"peak ${recent_peak:.2f} on {recent_peak_date}",
+        delta_color="off",
+        help="How far the current price has fallen from the 60-day high. "
+             "A large drawdown right before a release signal often means the pullback isn't done.",
+    )
+    kc2.metric(
+        "Days since 60d peak",
+        str(days_since_peak),
+        help="How long ago the 60-day peak was set. Releases within a few days of a fresh peak are higher-risk.",
+    )
+    kc3.metric(
+        "Release-blocking price",
+        f"${price_vuln:.2f}",
+        delta=f"{(price_vuln/close - 1)*100:+.1f}% from current",
+        delta_color="off",
+        help="If today's close falls below this level (today's SMA30), the 'price > SMA30' release condition "
+             "breaks and the lockout stays active. Watch this if running intraday.",
+    )
+
+    st.info(esc(
+        f"⚠️ **Watch the SMA30 line at \\${price_vuln:.2f}**. "
+        f"If TQQQ closes below this today, the release will NOT fire and you stay in cash. "
+        f"If it closes above, the release fires and you buy at Monday's open. "
+        f"Historical context: D_rising_sma30 has caught knives ~23% of the time. "
+        f"The 8% intraday stop is the only protection against the bad releases. "
+        f"The 2020-02-24 release fired with all 4 conditions met and was followed by a -36% TQQQ drawdown over 10 days."
+    ))
 
 st.divider()
 
