@@ -718,7 +718,7 @@ st.divider()
   #  chart_df.columns = ["Extension %", "Z-threshold %"]
    # st.line_chart(chart_df)
 
-st.divider()
+#st.divider()
 
 # --- Position ---
 st.header("💼 Your position")
