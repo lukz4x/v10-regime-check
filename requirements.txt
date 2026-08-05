@@ -1,5 +1,3 @@
-This is what I have on the requirements.txt:
-
 streamlit=1.32.0
 alpaca-py>=0.26.0
 pytz
