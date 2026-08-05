@@ -713,12 +713,12 @@ r4c2.metric("60-day high", f"${confirmed_last['high60']:.2f}",
 st.divider()
 
 # --- Chart ---
-#with st.expander("📊 Extension vs Z-threshold (last 2 years)"):
-    #chart_df = confirmed_ind[["date", "ext", "z_threshold"]].dropna().tail(504).set_index("date")
-  #  chart_df.columns = ["Extension %", "Z-threshold %"]
-   # st.line_chart(chart_df)
+with st.expander("📊 Extension vs Z-threshold (last 2 years)"):
+    chart_df = confirmed_ind[["date", "ext", "z_threshold"]].dropna().tail(504).set_index("date")
+    chart_df.columns = ["Extension %", "Z-threshold %"]
+    st.line_chart(chart_df)
 
-#st.divider()
+st.divider()
 
 # --- Position ---
 st.header("💼 Your position")
