@@ -716,7 +716,7 @@ st.divider()
 with st.expander("📊 Extension vs Z-threshold (last 2 years)"):
     chart_df = confirmed_ind[["date", "ext", "z_threshold"]].dropna().tail(504).set_index("date")
     chart_df.columns = ["Extension %", "Z-threshold %"]
-    st.line_chart(chart_df)
+   # st.line_chart(chart_df)
 
 st.divider()
 
