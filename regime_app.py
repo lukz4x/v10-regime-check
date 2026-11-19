@@ -314,10 +314,415 @@ def make_decision(row, locked, days_locked):
 
 
 # ============================================================================
+# B2 + STANDARD NOISE BANDS — CONFIG
+# ============================================================================
+B2_SLOPE_LAG = 5               # EMA20/EMA50 compared with 5 sessions earlier
+NOISE_LOOKBACK = 14            # prior valid sessions used for the noise profile
+NOISE_CHECK_MINUTES = list(range(30, 361, 30))   # 10:00, 10:30 ... 15:30 ET
+MIN_SESSION_BARS = 375         # a session needs >= 375 of 390 minute bars
+MINUTE_HISTORY_DAYS = 35       # calendar days of 1-min bars to request
+
+
+# ============================================================================
+# B2 + NOISE BANDS — DATA
+# ============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_ohlc(ticker: str, period: str) -> pd.DataFrame:
+    """Daily OHLC (split/dividend adjusted) for B2's EMAs and the daily replay."""
+    df = yf.Ticker(ticker).history(period=period, auto_adjust=True, actions=False)
+    if df is None or df.empty:
+        raise RuntimeError(f"Yahoo returned no data for {ticker}")
+    df = df.reset_index()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    date_col = next((c for c in df.columns if c in ("date", "datetime", "index")), None)
+    out = df[[date_col, "open", "high", "low", "close"]].copy()
+    out.columns = ["date", "open", "high", "low", "close"]
+    out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.normalize()
+    out = out.dropna().drop_duplicates(subset=["date"], keep="last")
+    return out.sort_values("date").reset_index(drop=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_alpaca_minute_bars(ticker: str, start_iso: str, end_iso: str,
+                             _api_key: str, _api_secret: str, feed: str = "iex") -> pd.DataFrame:
+    """Regular-hours 1-minute bars, paginated. Minute index 0 = 9:30 ET."""
+    url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
+    headers = {"APCA-API-KEY-ID": _api_key, "APCA-API-SECRET-KEY": _api_secret,
+               "accept": "application/json"}
+    params = {"timeframe": "1Min", "start": start_iso, "end": end_iso, "limit": 10000,
+              "adjustment": "split", "feed": feed, "sort": "asc"}
+    rows = []
+    while True:
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows.extend(data.get("bars") or [])
+        token = data.get("next_page_token")
+        if not token:
+            break
+        params["page_token"] = token
+    return bars_from_rows(rows)
+
+
+def bars_from_rows(rows) -> pd.DataFrame:
+    cols = ["ts", "session", "minute", "open", "high", "low", "close", "volume"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows).rename(columns={"t": "ts", "o": "open", "h": "high", "l": "low",
+                                            "c": "close", "v": "volume"})
+    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(ET)
+    df["session"] = df["ts"].dt.date
+    df["minute"] = df["ts"].dt.hour * 60 + df["ts"].dt.minute - (9 * 60 + 30)
+    df = df[(df["minute"] >= 0) & (df["minute"] < 390)]
+    return df[cols].sort_values("ts").reset_index(drop=True)
+
+
+def build_b2_daily(yahoo_ohlc: pd.DataFrame, snap: dict, last_complete_date: date) -> pd.DataFrame:
+    """Yahoo OHLC through the day before the last complete session, plus Alpaca's
+    confirmed bar for that session (same convention as the D-rising series)."""
+    df = yahoo_ohlc[yahoo_ohlc["date"].dt.date < last_complete_date].copy()
+    bar = None
+    for key in ("dailyBar", "prevDailyBar"):
+        b = snap.get(key)
+        if b and parse_iso(b["t"]).astimezone(ET).date() == last_complete_date:
+            bar = b
+            break
+    if bar is not None:
+        df = pd.concat([df, pd.DataFrame([{
+            "date": pd.Timestamp(last_complete_date), "open": float(bar["o"]),
+            "high": float(bar["h"]), "low": float(bar["l"]), "close": float(bar["c"]),
+        }])], ignore_index=True)
+    df = df.sort_values("date").reset_index(drop=True)
+    for n in (10, 20, 50):
+        df[f"ema{n}"] = df["close"].ewm(span=n, adjust=False).mean()
+    df["ema20_lag"] = df["ema20"].shift(B2_SLOPE_LAG)
+    df["ema50_lag"] = df["ema50"].shift(B2_SLOPE_LAG)
+    return df
+
+
+# ============================================================================
+# B2 — REGIME AND STATE MACHINE
+# ============================================================================
+def b2_regime(row) -> dict:
+    """Regime for the NEXT session, from a completed day's EMAs."""
+    e10, e20, e50 = row["ema10"], row["ema20"], row["ema50"]
+    if e10 > e20 > e50 and e20 > row["ema20_lag"]:
+        return {"name": "Strong bullish", "trail": 0.08, "rec": e10, "rec_name": "EMA10"}
+    if e10 < e20 < e50 and e20 < row["ema20_lag"]:
+        return {"name": "Bearish", "trail": 0.04, "rec": e20, "rec_name": "EMA20"}
+    if row["ema50"] > row["ema50_lag"]:
+        return {"name": "Transition (EMA50 rising)", "trail": 0.08, "rec": e20, "rec_name": "EMA20"}
+    return {"name": "Transition", "trail": 0.06, "rec": e20, "rec_name": "EMA20"}
+
+
+def b2_new_state() -> dict:
+    return {"holding": False, "peak": 0.0, "armed": False, "count": 0,
+            "pending": False, "entry_price": None, "entry_date": None, "events": []}
+
+
+def b2_step_daily(st_: dict, day_row, reg: dict) -> None:
+    """Daily-bar approximation (used only where minute bars are unavailable).
+    Exit if the day's low reaches the threshold; re-enter at the close if the day
+    traded at/below the recovery EMA (arming) and closed above it."""
+    d_ = day_row["date"].date()
+    rec, tr = reg["rec"], reg["trail"]
+    if st_["holding"]:
+        thr = min(st_["peak"] * (1 - tr), rec)
+        if day_row["low"] <= thr:
+            px = min(thr, day_row["open"])
+            st_.update(holding=False, armed=day_row["close"] <= rec, count=0)
+            st_["events"].append((d_, "EXIT (daily approx.)", px))
+        else:
+            st_["peak"] = max(st_["peak"], day_row["high"])
+        return
+    if day_row["low"] <= rec:
+        st_["armed"] = True
+    if st_["armed"] and day_row["close"] > rec:
+        st_.update(holding=True, peak=day_row["close"], armed=False, count=0,
+                   entry_price=day_row["close"], entry_date=d_)
+        st_["events"].append((d_, "ENTRY (daily approx.)", day_row["close"]))
+
+
+def b2_step_minutes(st_: dict, bars: pd.DataFrame, reg: dict, session_date) -> None:
+    """Exact B2 logic on one session of 1-minute bars (the tested specification):
+    stop = min(peak × (1 − trail), recovery EMA) against each bar's low; after an exit,
+    a close at/below the recovery EMA arms re-entry; two consecutive closes above it
+    schedule a buy at the next minute's open."""
+    rec, tr = reg["rec"], reg["trail"]
+    st_["count"] = 0
+    for b in bars.itertuples(index=False):
+        if st_["pending"]:
+            st_.update(holding=True, peak=b.open, pending=False, armed=False, count=0,
+                       entry_price=b.open, entry_date=session_date)
+            st_["events"].append((session_date, f"ENTRY {b.ts.strftime('%H:%M')}", b.open))
+            continue
+        if st_["holding"]:
+            thr = min(st_["peak"] * (1 - tr), rec)
+            if b.low <= thr:
+                px = min(thr, b.open)
+                st_.update(holding=False, armed=b.close <= rec, count=0)
+                st_["events"].append((session_date, f"EXIT {b.ts.strftime('%H:%M')}", px))
+            else:
+                st_["peak"] = max(st_["peak"], b.high)
+            continue
+        if b.close <= rec:
+            st_["armed"] = True
+            st_["count"] = 0
+        elif st_["armed"]:
+            st_["count"] += 1
+            if st_["count"] >= 2:
+                st_["pending"] = True
+                st_["events"].append((session_date, f"RE-ENTRY SIGNAL {b.ts.strftime('%H:%M')}", b.close))
+
+
+def b2_replay(daily: pd.DataFrame, minute_bars: pd.DataFrame, today_et: date,
+              warmup: int = 60) -> dict:
+    """Replay B2 through the last complete session (daily approximation for older
+    history, exact minute logic for sessions that have 1-minute bars). Returns the
+    state going into the next session, plus today's in-progress state if any."""
+    st_ = b2_new_state()
+    minute_sessions = set(minute_bars["session"].unique()) if len(minute_bars) else set()
+    for i in range(max(warmup, B2_SLOPE_LAG + 1), len(daily)):
+        reg = b2_regime(daily.iloc[i - 1])
+        row = daily.iloc[i]
+        d_ = row["date"].date()
+        if d_ in minute_sessions:
+            b2_step_minutes(st_, minute_bars[minute_bars["session"] == d_], reg, d_)
+        else:
+            b2_step_daily(st_, row, reg)
+    st_["next_regime"] = b2_regime(daily.iloc[-1])
+    st_["state_before_today"] = {k: st_[k] for k in ("holding", "peak", "armed", "pending")}
+    today_bars = minute_bars[minute_bars["session"] == today_et] if len(minute_bars) else minute_bars
+    if daily["date"].iloc[-1].date() < today_et and len(today_bars):
+        b2_step_minutes(st_, today_bars, st_["next_regime"], today_et)
+        st_["ran_today"] = True
+    else:
+        st_["ran_today"] = False
+    return st_
+
+
+# ============================================================================
+# NOISE BANDS
+# ============================================================================
+def session_minutes(bars_one: pd.DataFrame) -> pd.DataFrame:
+    """Reindex a session to minutes 0..389, forward-filling missing closes."""
+    s = bars_one.set_index("minute").sort_index()
+    s = s[~s.index.duplicated(keep="last")].reindex(range(390))
+    s["close"] = s["close"].ffill()
+    return s
+
+
+def noise_profile(minute_bars: pd.DataFrame, before: date, lookback: int = NOISE_LOOKBACK):
+    """Average |close/open − 1| at each minute over the last `lookback` valid sessions
+    strictly before `before`."""
+    valid = []
+    for d_, g in minute_bars[minute_bars["session"] < before].groupby("session"):
+        mins = set(g["minute"])
+        if len(g) >= MIN_SESSION_BARS and 0 in mins and 389 in mins:
+            valid.append(d_)
+    used = valid[-lookback:]
+    if not used:
+        return None, []
+    moves = []
+    for d_ in used:
+        s = session_minutes(minute_bars[minute_bars["session"] == d_])
+        o = s["open"].iloc[0] if not np.isnan(s["open"].iloc[0]) else s["close"].dropna().iloc[0]
+        moves.append(np.abs(s["close"].values / o - 1))
+    return np.nanmean(np.vstack(moves), axis=0), used
+
+
+def noise_today(today_bars: pd.DataFrame, noise: np.ndarray, prev_close: float) -> dict:
+    """Bands, VWAP and the scheduled half-hour signals for the current session."""
+    tb = today_bars.sort_values("minute")
+    day_open = float(tb["open"].iloc[0])
+    up_base, lo_base = max(day_open, prev_close), min(day_open, prev_close)
+    tp = (tb["high"] + tb["low"] + tb["close"]) / 3
+    vwap = (tp * tb["volume"]).cumsum() / tb["volume"].cumsum().replace(0, np.nan)
+    tb = tb.assign(vwap=vwap.values)
+    by_min = tb.set_index("minute")
+    last_min = int(tb["minute"].iloc[-1])
+    checks, position = [], 0
+    for m in NOISE_CHECK_MINUTES:
+        if last_min < m - 1:
+            break
+        prior = by_min.loc[:m - 1]
+        if prior.empty:
+            continue
+        bar = prior.iloc[-1]
+        pm = int(prior.index[-1])
+        upper = up_base * (1 + noise[pm])
+        lower = lo_base * (1 - noise[pm])
+        c, vw = float(bar["close"]), float(bar["vwap"])
+        sig = 1 if c > max(upper, vw) else (-1 if c < min(lower, vw) else 0)
+        position = sig
+        checks.append({"Check (ET)": f"{(570 + m) // 60}:{(570 + m) % 60:02d}",
+                       "Close": c, "Upper band": upper, "Lower band": lower, "VWAP": vw,
+                       "Signal": {1: "LONG TQQQ", -1: "SHORT (buy SQQQ)", 0: "FLAT"}[sig]})
+    nxt = next((m for m in NOISE_CHECK_MINUTES if m - 1 > last_min), None)
+    preview = None
+    if nxt is not None:
+        cur_vwap = float(tb["vwap"].iloc[-1])
+        upper_n = up_base * (1 + noise[nxt - 1])
+        lower_n = lo_base * (1 - noise[nxt - 1])
+        preview = {"time": f"{(570 + nxt) // 60}:{(570 + nxt) % 60:02d}",
+                   "long_above": max(upper_n, cur_vwap), "short_below": min(lower_n, cur_vwap),
+                   "upper": upper_n, "lower": lower_n, "vwap": cur_vwap}
+    return {"open": day_open, "prev_close": prev_close, "checks": checks, "position": position,
+            "next": preview, "last_close": float(tb["close"].iloc[-1]), "vwap": float(tb["vwap"].iloc[-1])}
+
+
+# ============================================================================
+# B2 + NOISE BANDS — RENDERING
+# ============================================================================
+def render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_state):
+    st.header("🧭 B2 + Standard Noise Bands")
+    st.caption(
+        "B2 = daily EMA10/20/50 regime with an adaptive trailing stop and intraday re-entry. "
+        "Noise bands trade only while B2 is out, on half-hour checks from 10:00 to 15:30 ET, "
+        "and are always flat at the close. Short signals are executed by buying SQQQ."
+    )
+    SESSION_ = session_state["session"]
+    last_complete_date = session_state["latest_complete_date"]
+    now_et_ = session_state["now_et"]
+    today_ = now_et_.date()
+
+    try:
+        with st.spinner("Loading daily OHLC and 1-minute bars for B2..."):
+            ohlc = fetch_yahoo_ohlc(ticker, period)
+            daily = build_b2_daily(ohlc, snap, last_complete_date)
+            start = (now_et_ - timedelta(days=MINUTE_HISTORY_DAYS)).astimezone(ZoneInfo("UTC"))
+            end = now_et_.astimezone(ZoneInfo("UTC"))
+            if feed == "sip":   # free Alpaca plans can't query the most recent 15 minutes of SIP
+                end = end - timedelta(minutes=16)
+            bars = fetch_alpaca_minute_bars(ticker, start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                            end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                            api_key, api_secret, feed=feed)
+    except Exception as e:
+        st.error(f"B2 data unavailable: {e}")
+        st.divider()
+        return
+
+    if len(daily) < 70:
+        st.error("Not enough daily history for B2 (need about 70 sessions).")
+        st.divider()
+        return
+
+    state_b2 = b2_replay(daily, bars, today_)
+    reg = state_b2["next_regime"]
+
+    with st.expander("⚙️ Override B2 state (if your account follows B2 and differs from the replay)"):
+        st.caption("Older history is replayed on daily bars (approximation); the last ~5 weeks use exact "
+                   "1-minute logic. If your actual B2 position differs, set it here.")
+        if st.checkbox("Use manual B2 state", key="b2_override"):
+            state_b2["holding"] = st.checkbox("B2 currently holding shares?", value=bool(state_b2["holding"]))
+            state_b2["peak"] = st.number_input("Highest price since entry", min_value=0.0,
+                                               value=float(state_b2["peak"] or 0.0), step=0.01)
+            state_b2["armed"] = st.checkbox("Re-entry armed (traded at/below recovery EMA since exit)?",
+                                            value=bool(state_b2["armed"]))
+
+    live_px = session_state["live_price"]
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    rc1.metric("Regime (for today)" if SESSION_ in ("OPEN", "PRE_MARKET") else "Regime (next session)",
+               reg["name"])
+    rc2.metric("Trailing stop", f"{reg['trail'] * 100:.0f}%")
+    rc3.metric(f"Recovery EMA ({reg['rec_name']})", f"${reg['rec']:.2f}",
+               delta=f"{(live_px / reg['rec'] - 1) * 100:+.1f}% live vs EMA", delta_color="off")
+    last = daily.iloc[-1]
+    rc4.metric("EMA10 / 20 / 50", f"{last['ema10']:.2f} / {last['ema20']:.2f} / {last['ema50']:.2f}")
+
+    if state_b2["holding"]:
+        thr = min(state_b2["peak"] * (1 - reg["trail"]), reg["rec"])
+        st.success(esc(
+            f"🟢 **B2 IN — hold TQQQ shares.** Highest since entry ${state_b2['peak']:.2f}. "
+            f"Exit if TQQQ trades at or below **${thr:.2f}** "
+            f"(min of {reg['trail'] * 100:.0f}% trail ${state_b2['peak'] * (1 - reg['trail']):.2f} "
+            f"and {reg['rec_name']} ${reg['rec']:.2f}). Noise bands inactive."
+        ))
+    else:
+        if state_b2.get("pending"):
+            st.success(esc(
+                f"🟢 **B2 RE-ENTRY SIGNAL — buy TQQQ shares at the next minute's open.** "
+                f"Close any noise-band position first."
+            ))
+        else:
+            armed_txt = ("armed — needs **two consecutive 1-minute closes above** "
+                         if state_b2["armed"] else
+                         "not yet armed — price must first trade at/below, then make two 1-minute closes above ")
+            st.error(esc(
+                f"🔴 **B2 OUT — no TQQQ shares for B2.** Re-entry is {armed_txt}"
+                f"**${reg['rec']:.2f}** ({reg['rec_name']}). Live ${live_px:.2f} is "
+                f"{(reg['rec'] / live_px - 1) * 100:+.1f}% away. Noise bands are active."
+            ))
+
+    # --- Noise bands ---
+    st.subheader("Noise bands (active only while B2 is out)")
+    noise, used = noise_profile(bars, today_ if SESSION_ == "OPEN" else today_ + timedelta(days=1))
+    if noise is None:
+        st.warning("Not enough complete 1-minute sessions to build the noise profile. "
+                   "Try the SIP feed; IEX bars can be too sparse.")
+    else:
+        if len(used) < NOISE_LOOKBACK:
+            st.warning(f"Noise profile uses only {len(used)} valid sessions (target {NOISE_LOOKBACK}). "
+                       "IEX bars may be missing minutes; the SIP feed is more reliable.")
+        today_bars = bars[bars["session"] == today_] if len(bars) else bars
+        if SESSION_ == "OPEN" and len(today_bars) and not state_b2["holding"]:
+            nt = noise_today(today_bars, noise, session_state["latest_complete_close"])
+            pos_txt = {1: "🟢 **LONG TQQQ** (100% of noise capital)",
+                       -1: "🔴 **SHORT — hold SQQQ** (100% of noise capital)",
+                       0: "⚪ **FLAT**"}[nt["position"]]
+            if not nt["checks"]:
+                pos_txt = "⚪ **FLAT** — first check is at 10:00 ET"
+            st.markdown(esc(f"Current noise-band position: {pos_txt}. Close everything by the 4:00 PM close."))
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("Today's open", f"${nt['open']:.2f}")
+            n2.metric("Prior close", f"${nt['prev_close']:.2f}")
+            n3.metric("VWAP now", f"${nt['vwap']:.2f}")
+            n4.metric("Last price (bar)", f"${nt['last_close']:.2f}")
+            if nt["next"]:
+                nx = nt["next"]
+                st.info(esc(
+                    f"**Next check {nx['time']} ET** (signal from the 1-minute bar closing just before): "
+                    f"LONG if close > **${nx['long_above']:.2f}** (upper band ${nx['upper']:.2f} and VWAP), "
+                    f"SHORT if close < **${nx['short_below']:.2f}** (lower band ${nx['lower']:.2f} and VWAP), "
+                    f"otherwise FLAT. VWAP moves during the half hour."
+                ))
+            if nt["checks"]:
+                tbl = pd.DataFrame(nt["checks"])
+                for col in ("Close", "Upper band", "Lower band", "VWAP"):
+                    tbl[col] = tbl[col].map(lambda v: f"${v:.2f}")
+                st.dataframe(tbl, use_container_width=True, hide_index=True)
+        elif state_b2["holding"]:
+            st.caption("B2 holds shares, so the noise-band system is off.")
+        else:
+            prof = pd.DataFrame({
+                "Check (ET)": [f"{(570 + m) // 60}:{(570 + m) % 60:02d}" for m in NOISE_CHECK_MINUTES],
+                "Expected move from open": [f"{noise[m - 1] * 100:.2f}%" for m in NOISE_CHECK_MINUTES],
+            })
+            st.caption(esc(
+                "Market not open. Bands will be max(open, prior close) × (1 + move) and "
+                "min(open, prior close) × (1 − move), combined with VWAP at each check. "
+                f"Prior close ${session_state['latest_complete_close']:.2f}."
+            ))
+            st.dataframe(prof, use_container_width=True, hide_index=True)
+        st.caption(f"Noise profile from {len(used)} sessions: "
+                   f"{used[0] if used else '—'} to {used[-1] if used else '—'} · feed: {feed}.")
+
+    with st.expander("Recent B2 events"):
+        ev = state_b2["events"][-15:]
+        if ev:
+            st.dataframe(pd.DataFrame([(str(a), b, f"${c:.2f}") for a, b, c in ev],
+                                      columns=["Date", "Event", "Price"]),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.write("No B2 events in the replay window.")
+    st.divider()
+
+
+# ============================================================================
 # UI
 # ============================================================================
-st.set_page_config(page_title="TQQQ D_rising_sma30", page_icon="📈", layout="wide")
-st.title("📈 TQQQ D_rising_sma30 Daily Decision")
+st.set_page_config(page_title="TQQQ B2 + D_rising_sma30", page_icon="📈", layout="wide")
+st.title("📈 TQQQ Daily Decision — B2 + Noise Bands and D_rising_sma30")
 st.caption(
     "State machine runs only on confirmed closes. Live prices are preview only. "
     "Historical data: Yahoo Finance. Live price + clock: Alpaca."
@@ -476,6 +881,9 @@ pc3.metric(
 )
 
 st.divider()
+
+# --- B2 + Standard Noise Bands (shown above the D-rising section) ---
+render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_state)
 
 # --- Confirmed strategy state ---
 st.header("🤖 Strategy state — based on confirmed closes")
