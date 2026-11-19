@@ -92,6 +92,9 @@ def fetch_alpaca_snapshot(ticker: str, _api_key: str, _api_secret: str, feed: st
         "accept": "application/json",
     }
     r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code == 403 and feed != "iex":
+        # Free Alpaca plans can't read real-time SIP (snapshots are real-time): use IEX for live data.
+        r = requests.get(url.replace(f"feed={feed}", "feed=iex"), headers=headers, timeout=10)
     r.raise_for_status()
     data = r.json()
     if ticker not in data:
@@ -389,16 +392,34 @@ def load_minute_bars(ticker, days, feed, api_key, api_secret, now_et_) -> pd.Dat
     fmt = "%Y-%m-%dT%H:%M:%SZ"
     midnight = datetime.combine(now_et_.date(), time(0, 0), tzinfo=ET)
     start = midnight - timedelta(days=days)
-    hist = fetch_alpaca_minute_history(ticker, start.astimezone(utc).strftime(fmt),
-                                       midnight.astimezone(utc).strftime(fmt),
-                                       api_key, api_secret, feed)
+    # Completed sessions always come from SIP when possible: free plans can read SIP history
+    # (only the last 15 minutes are restricted), and IEX misses too many minutes on thinner
+    # tickers such as SPXL to build a noise profile. Falls back to the chosen feed.
+    hist = None
+    for f_ in dict.fromkeys(["sip", feed]):
+        try:
+            hist = fetch_alpaca_minute_history(ticker, start.astimezone(utc).strftime(fmt),
+                                               midnight.astimezone(utc).strftime(fmt),
+                                               api_key, api_secret, f_)
+            if len(hist):
+                break
+        except Exception:
+            continue
+    if hist is None:
+        raise RuntimeError("Alpaca 1-minute history unavailable on both SIP and " + feed)
     end = now_et_
     if feed == "sip":   # free Alpaca plans can't query the most recent 15 minutes of SIP
         end = end - timedelta(minutes=16)
     today = pd.DataFrame(columns=hist.columns)
     if end > midnight:
-        today = fetch_alpaca_minute_bars(ticker, midnight.astimezone(utc).strftime(fmt),
-                                         end.astimezone(utc).strftime(fmt), api_key, api_secret, feed)
+        try:
+            today = fetch_alpaca_minute_bars(ticker, midnight.astimezone(utc).strftime(fmt),
+                                             end.astimezone(utc).strftime(fmt), api_key, api_secret, feed)
+        except Exception:
+            if feed == "iex":
+                raise
+            today = fetch_alpaca_minute_bars(ticker, midnight.astimezone(utc).strftime(fmt),
+                                             now_et_.astimezone(utc).strftime(fmt), api_key, api_secret, "iex")
     out = pd.concat([hist, today], ignore_index=True) if len(today) else hist
     return out.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
@@ -554,12 +575,16 @@ def session_minutes(bars_one: pd.DataFrame) -> pd.DataFrame:
 def noise_profile(minute_bars: pd.DataFrame, before: date, lookback: int = NOISE_LOOKBACK):
     """Average |close/open − 1| at each minute over the last `lookback` valid sessions
     strictly before `before`."""
-    valid = []
+    valid, loose = [], []
     for d_, g in minute_bars[minute_bars["session"] < before].groupby("session"):
         mins = set(g["minute"])
         if len(g) >= MIN_SESSION_BARS and 0 in mins and 389 in mins:
             valid.append(d_)
+        elif len(g) >= 200 and min(mins) <= 5:   # sparse feed: usable after forward-fill
+            loose.append(d_)
     used = valid[-lookback:]
+    if len(used) < lookback:   # top up with sparser sessions rather than failing
+        used = sorted(set(used) | set(loose[-(lookback - len(used)):] if len(used) < lookback else []))[-lookback:]
     if not used:
         return None, []
     moves = []
