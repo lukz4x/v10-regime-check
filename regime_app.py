@@ -320,7 +320,12 @@ B2_SLOPE_LAG = 5               # EMA20/EMA50 compared with 5 sessions earlier
 NOISE_LOOKBACK = 14            # prior valid sessions used for the noise profile
 NOISE_CHECK_MINUTES = list(range(30, 361, 30))   # 10:00, 10:30 ... 15:30 ET
 MIN_SESSION_BARS = 375         # a session needs >= 375 of 390 minute bars
-MINUTE_HISTORY_DAYS = 35       # calendar days of 1-min bars to request
+B2_REPLAY_WINDOWS = {"6 months": 183, "1 year": 365, "2 years": 730}   # 1-min history from Alpaca
+TICKER_PAIRS = {
+    "TQQQ / SQQQ  (Nasdaq-100, 3x)": ("TQQQ", "SQQQ"),
+    "SPXL / SPXS  (S&P 500, 3x)": ("SPXL", "SPXS"),
+    "Other…": None,
+}
 
 
 # ============================================================================
@@ -342,8 +347,7 @@ def fetch_yahoo_ohlc(ticker: str, period: str) -> pd.DataFrame:
     return out.sort_values("date").reset_index(drop=True)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_alpaca_minute_bars(ticker: str, start_iso: str, end_iso: str,
+def _fetch_minutes_raw(ticker: str, start_iso: str, end_iso: str,
                              _api_key: str, _api_secret: str, feed: str = "iex") -> pd.DataFrame:
     """Regular-hours 1-minute bars, paginated. Minute index 0 = 9:30 ET."""
     url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
@@ -362,6 +366,41 @@ def fetch_alpaca_minute_bars(ticker: str, start_iso: str, end_iso: str,
             break
         params["page_token"] = token
     return bars_from_rows(rows)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_alpaca_minute_history(ticker: str, start_iso: str, end_iso: str,
+                                _api_key: str, _api_secret: str, feed: str = "iex") -> pd.DataFrame:
+    """Completed sessions only (end = today's midnight ET), so it can be cached for hours."""
+    return _fetch_minutes_raw(ticker, start_iso, end_iso, _api_key, _api_secret, feed)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_alpaca_minute_bars(ticker: str, start_iso: str, end_iso: str,
+                             _api_key: str, _api_secret: str, feed: str = "iex") -> pd.DataFrame:
+    """Today's session so far; refreshed every minute."""
+    return _fetch_minutes_raw(ticker, start_iso, end_iso, _api_key, _api_secret, feed)
+
+
+def load_minute_bars(ticker, days, feed, api_key, api_secret, now_et_) -> pd.DataFrame:
+    """Alpaca 1-minute history for the B2 replay and noise profile: completed sessions
+    (cached 6 h) plus today's session so far (cached 60 s)."""
+    utc = ZoneInfo("UTC")
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    midnight = datetime.combine(now_et_.date(), time(0, 0), tzinfo=ET)
+    start = midnight - timedelta(days=days)
+    hist = fetch_alpaca_minute_history(ticker, start.astimezone(utc).strftime(fmt),
+                                       midnight.astimezone(utc).strftime(fmt),
+                                       api_key, api_secret, feed)
+    end = now_et_
+    if feed == "sip":   # free Alpaca plans can't query the most recent 15 minutes of SIP
+        end = end - timedelta(minutes=16)
+    today = pd.DataFrame(columns=hist.columns)
+    if end > midnight:
+        today = fetch_alpaca_minute_bars(ticker, midnight.astimezone(utc).strftime(fmt),
+                                         end.astimezone(utc).strftime(fmt), api_key, api_secret, feed)
+    out = pd.concat([hist, today], ignore_index=True) if len(today) else hist
+    return out.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
 
 def bars_from_rows(rows) -> pd.DataFrame:
@@ -557,7 +596,7 @@ def noise_today(today_bars: pd.DataFrame, noise: np.ndarray, prev_close: float) 
         position = sig
         checks.append({"Check (ET)": f"{(570 + m) // 60}:{(570 + m) % 60:02d}",
                        "Close": c, "Upper band": upper, "Lower band": lower, "VWAP": vw,
-                       "Signal": {1: "LONG TQQQ", -1: "SHORT (buy SQQQ)", 0: "FLAT"}[sig]})
+                       "sig": sig})
     nxt = next((m for m in NOISE_CHECK_MINUTES if m - 1 > last_min), None)
     preview = None
     if nxt is not None:
@@ -574,29 +613,46 @@ def noise_today(today_bars: pd.DataFrame, noise: np.ndarray, prev_close: float) 
 # ============================================================================
 # B2 + NOISE BANDS — RENDERING
 # ============================================================================
-def render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_state):
-    st.header("🧭 B2 + Standard Noise Bands")
+def _hm(m: int) -> str:
+    return f"{(570 + m) // 60}:{(570 + m) % 60:02d}"
+
+
+def render_action_card(color: str, action: str, detail: str, rows: list) -> None:
+    """Big action display: headline action, one line of detail, then a grid of key levels."""
+    cells = "".join(
+        f"<div style='flex:1;min-width:150px;padding:10px 14px;background:rgba(0,0,0,.18);"
+        f"border-radius:10px'><div style='font-size:.85rem;opacity:.8'>{esc(k)}</div>"
+        f"<div style='font-size:1.6rem;font-weight:700'>{esc(v)}</div></div>"
+        for k, v in rows)
+    st.markdown(
+        f"<div style='background:{color};color:white;border-radius:16px;padding:22px 26px;margin:8px 0 18px'>"
+        f"<div style='font-size:.95rem;letter-spacing:.08em;opacity:.85'>RECOMMENDED ACTION NOW</div>"
+        f"<div style='font-size:2.6rem;font-weight:800;line-height:1.15;margin:4px 0 8px'>{esc(action)}</div>"
+        f"<div style='font-size:1.1rem;margin-bottom:14px'>{esc(detail)}</div>"
+        f"<div style='display:flex;flex-wrap:wrap;gap:10px'>{cells}</div></div>",
+        unsafe_allow_html=True)
+
+
+def render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, session_state,
+                      replay_days=365, capital=0.0):
+    st.header(f"🧭 B2 + Standard Noise Bands — {ticker} / {inverse}")
     st.caption(
         "B2 = daily EMA10/20/50 regime with an adaptive trailing stop and intraday re-entry. "
         "Noise bands trade only while B2 is out, on half-hour checks from 10:00 to 15:30 ET, "
-        "and are always flat at the close. Short signals are executed by buying SQQQ."
+        f"and are always flat at the close. Short signals are executed by buying {inverse}."
     )
     SESSION_ = session_state["session"]
     last_complete_date = session_state["latest_complete_date"]
     now_et_ = session_state["now_et"]
     today_ = now_et_.date()
+    GREEN, RED, GREY, BLUE = "#1b7f3b", "#b3261e", "#4a4f57", "#1f5fae"
 
     try:
-        with st.spinner("Loading daily OHLC and 1-minute bars for B2..."):
+        with st.spinner(f"Loading daily OHLC and {replay_days} days of Alpaca 1-minute bars "
+                        "(first load can take a minute; cached afterwards)..."):
             ohlc = fetch_yahoo_ohlc(ticker, period)
             daily = build_b2_daily(ohlc, snap, last_complete_date)
-            start = (now_et_ - timedelta(days=MINUTE_HISTORY_DAYS)).astimezone(ZoneInfo("UTC"))
-            end = now_et_.astimezone(ZoneInfo("UTC"))
-            if feed == "sip":   # free Alpaca plans can't query the most recent 15 minutes of SIP
-                end = end - timedelta(minutes=16)
-            bars = fetch_alpaca_minute_bars(ticker, start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                            end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                            api_key, api_secret, feed=feed)
+            bars = load_minute_bars(ticker, replay_days, feed, api_key, api_secret, now_et_)
     except Exception as e:
         st.error(f"B2 data unavailable: {e}")
         st.divider()
@@ -609,18 +665,92 @@ def render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_s
 
     state_b2 = b2_replay(daily, bars, today_)
     reg = state_b2["next_regime"]
+    n_min_sessions = bars["session"].nunique() if len(bars) else 0
 
     with st.expander("⚙️ Override B2 state (if your account follows B2 and differs from the replay)"):
-        st.caption("Older history is replayed on daily bars (approximation); the last ~5 weeks use exact "
-                   "1-minute logic. If your actual B2 position differs, set it here.")
+        st.caption(f"The replay uses exact Alpaca 1-minute logic for the last {n_min_sessions} sessions "
+                   "and a daily-bar approximation before that. If your actual B2 position differs, set it here.")
         if st.checkbox("Use manual B2 state", key="b2_override"):
             state_b2["holding"] = st.checkbox("B2 currently holding shares?", value=bool(state_b2["holding"]))
             state_b2["peak"] = st.number_input("Highest price since entry", min_value=0.0,
                                                value=float(state_b2["peak"] or 0.0), step=0.01)
             state_b2["armed"] = st.checkbox("Re-entry armed (traded at/below recovery EMA since exit)?",
                                             value=bool(state_b2["armed"]))
+            state_b2["pending"] = False
 
     live_px = session_state["live_price"]
+
+    # --- noise-band computation (needed for the big card) ---
+    noise, used = noise_profile(bars, today_ if SESSION_ == "OPEN" else today_ + timedelta(days=1))
+    today_bars = bars[bars["session"] == today_] if len(bars) else bars
+    nt = None
+    if noise is not None and SESSION_ == "OPEN" and len(today_bars):
+        nt = noise_today(today_bars, noise, session_state["latest_complete_close"])
+
+    inv_px = None
+    try:
+        inv_snap = fetch_alpaca_snapshot(inverse, api_key, api_secret, feed=feed)
+        inv_px = float((inv_snap.get("latestTrade") or {}).get("p") or 0) or None
+    except Exception:
+        pass
+
+    def shares(px):
+        return f" — {int(capital // px):,} shares (${capital:,.0f})" if capital and px else ""
+
+    # --- BIG ACTION CARD ---
+    if state_b2["holding"]:
+        thr = min(state_b2["peak"] * (1 - reg["trail"]), reg["rec"])
+        render_action_card(GREEN, f"HOLD {ticker} (B2 IN)",
+                           f"Sell all {ticker} if it trades at or below ${thr:.2f}. Noise bands are off.",
+                           [("Exit stop", f"${thr:.2f}"), ("Peak since entry", f"${state_b2['peak']:.2f}"),
+                            (f"Trail / {reg['rec_name']}", f"{reg['trail'] * 100:.0f}% / ${reg['rec']:.2f}"),
+                            (f"{ticker} live", f"${live_px:.2f}")])
+    elif state_b2.get("pending"):
+        render_action_card(GREEN, f"BUY {ticker} — B2 RE-ENTRY",
+                           f"Buy at the next minute's open{shares(live_px)}. Close any {inverse} first.",
+                           [(f"{reg['rec_name']}", f"${reg['rec']:.2f}"), (f"{ticker} live", f"${live_px:.2f}"),
+                            ("New stop trail", f"{reg['trail'] * 100:.0f}%")])
+    elif nt is None:
+        if noise is None:
+            detail = "B2 is out and the noise profile could not be built (try the SIP feed)."
+        else:
+            detail = ("B2 is out. Market closed — noise bands start with the 10:00 ET check. "
+                      f"B2 re-entry: two 1-minute closes above ${reg['rec']:.2f} ({reg['rec_name']}).")
+        render_action_card(GREY, "NO POSITION — WAIT", detail,
+                           [("B2 re-entry above", f"${reg['rec']:.2f}"), (f"{ticker} last", f"${live_px:.2f}"),
+                            ("Regime", reg["name"])])
+    else:
+        pos = nt["position"] if nt["checks"] else 0
+        last_chk = nt["checks"][-1]["Check (ET)"] if nt["checks"] else None
+        nx = nt["next"]
+        window = f"{last_chk} – {nx['time'] if nx else '16:00'} ET" if last_chk else \
+            f"9:30 – {nx['time'] if nx else '10:00'} ET (before first check)"
+        if pos == 1:
+            color, action = GREEN, f"BUY / HOLD {ticker}"
+            detail = f"Noise-band LONG for {window}{shares(live_px)}. Sell by 4:00 PM."
+        elif pos == -1:
+            color, action = RED, f"SELL SIGNAL → BUY {inverse}"
+            detail = f"Noise-band SHORT for {window}{shares(inv_px)}. Sell {inverse} by 4:00 PM."
+        else:
+            color, action = GREY, f"FLAT — no {ticker}, no {inverse}"
+            detail = f"Price is inside the bands for {window}."
+        if nt["checks"]:
+            c0 = nt["checks"][-1]
+            up, lo, vw = c0["Upper band"], c0["Lower band"], c0["VWAP"]
+            band_lbl = f"(set at {last_chk})"
+        else:
+            up, lo, vw = (nx["upper"], nx["lower"], nx["vwap"]) if nx else (np.nan, np.nan, nt["vwap"])
+            band_lbl = f"(for {nx['time']})" if nx else ""
+        rows = [(f"Upper band {band_lbl}", f"${up:.2f}"), (f"Lower band {band_lbl}", f"${lo:.2f}"),
+                ("VWAP", f"${nt['vwap']:.2f}"), (f"{ticker} last bar", f"${nt['last_close']:.2f}")]
+        if inv_px:
+            rows.append((f"{inverse} live", f"${inv_px:.2f}"))
+        if nx:
+            rows += [(f"Next check {nx['time']} ET: BUY {ticker} above", f"${nx['long_above']:.2f}"),
+                     (f"Next check: BUY {inverse} if {ticker} below", f"${nx['short_below']:.2f}")]
+        render_action_card(color, action, detail, rows)
+
+    # --- B2 detail ---
     rc1, rc2, rc3, rc4 = st.columns(4)
     rc1.metric("Regime (for today)" if SESSION_ in ("OPEN", "PRE_MARKET") else "Regime (next session)",
                reg["name"])
@@ -629,34 +759,14 @@ def render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_s
                delta=f"{(live_px / reg['rec'] - 1) * 100:+.1f}% live vs EMA", delta_color="off")
     last = daily.iloc[-1]
     rc4.metric("EMA10 / 20 / 50", f"{last['ema10']:.2f} / {last['ema20']:.2f} / {last['ema50']:.2f}")
+    if not state_b2["holding"] and not state_b2.get("pending"):
+        armed_txt = ("armed — needs two consecutive 1-minute closes above " if state_b2["armed"] else
+                     "not yet armed — price must first close at/below, then make two 1-minute closes above ")
+        st.caption(esc(f"B2 OUT. Re-entry is {armed_txt}${reg['rec']:.2f} ({reg['rec_name']}); "
+                       f"live ${live_px:.2f} is {(reg['rec'] / live_px - 1) * 100:+.1f}% away."))
 
-    if state_b2["holding"]:
-        thr = min(state_b2["peak"] * (1 - reg["trail"]), reg["rec"])
-        st.success(esc(
-            f"🟢 **B2 IN — hold TQQQ shares.** Highest since entry ${state_b2['peak']:.2f}. "
-            f"Exit if TQQQ trades at or below **${thr:.2f}** "
-            f"(min of {reg['trail'] * 100:.0f}% trail ${state_b2['peak'] * (1 - reg['trail']):.2f} "
-            f"and {reg['rec_name']} ${reg['rec']:.2f}). Noise bands inactive."
-        ))
-    else:
-        if state_b2.get("pending"):
-            st.success(esc(
-                f"🟢 **B2 RE-ENTRY SIGNAL — buy TQQQ shares at the next minute's open.** "
-                f"Close any noise-band position first."
-            ))
-        else:
-            armed_txt = ("armed — needs **two consecutive 1-minute closes above** "
-                         if state_b2["armed"] else
-                         "not yet armed — price must first trade at/below, then make two 1-minute closes above ")
-            st.error(esc(
-                f"🔴 **B2 OUT — no TQQQ shares for B2.** Re-entry is {armed_txt}"
-                f"**${reg['rec']:.2f}** ({reg['rec_name']}). Live ${live_px:.2f} is "
-                f"{(reg['rec'] / live_px - 1) * 100:+.1f}% away. Noise bands are active."
-            ))
-
-    # --- Noise bands ---
+    # --- Noise band detail ---
     st.subheader("Noise bands (active only while B2 is out)")
-    noise, used = noise_profile(bars, today_ if SESSION_ == "OPEN" else today_ + timedelta(days=1))
     if noise is None:
         st.warning("Not enough complete 1-minute sessions to build the noise profile. "
                    "Try the SIP feed; IEX bars can be too sparse.")
@@ -664,45 +774,36 @@ def render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_s
         if len(used) < NOISE_LOOKBACK:
             st.warning(f"Noise profile uses only {len(used)} valid sessions (target {NOISE_LOOKBACK}). "
                        "IEX bars may be missing minutes; the SIP feed is more reliable.")
-        today_bars = bars[bars["session"] == today_] if len(bars) else bars
-        if SESSION_ == "OPEN" and len(today_bars) and not state_b2["holding"]:
-            nt = noise_today(today_bars, noise, session_state["latest_complete_close"])
-            pos_txt = {1: "🟢 **LONG TQQQ** (100% of noise capital)",
-                       -1: "🔴 **SHORT — hold SQQQ** (100% of noise capital)",
-                       0: "⚪ **FLAT**"}[nt["position"]]
-            if not nt["checks"]:
-                pos_txt = "⚪ **FLAT** — first check is at 10:00 ET"
-            st.markdown(esc(f"Current noise-band position: {pos_txt}. Close everything by the 4:00 PM close."))
+        if nt is not None:
             n1, n2, n3, n4 = st.columns(4)
             n1.metric("Today's open", f"${nt['open']:.2f}")
             n2.metric("Prior close", f"${nt['prev_close']:.2f}")
             n3.metric("VWAP now", f"${nt['vwap']:.2f}")
             n4.metric("Last price (bar)", f"${nt['last_close']:.2f}")
-            if nt["next"]:
-                nx = nt["next"]
-                st.info(esc(
-                    f"**Next check {nx['time']} ET** (signal from the 1-minute bar closing just before): "
-                    f"LONG if close > **${nx['long_above']:.2f}** (upper band ${nx['upper']:.2f} and VWAP), "
-                    f"SHORT if close < **${nx['short_below']:.2f}** (lower band ${nx['lower']:.2f} and VWAP), "
-                    f"otherwise FLAT. VWAP moves during the half hour."
-                ))
             if nt["checks"]:
                 tbl = pd.DataFrame(nt["checks"])
+                tbl["Window (ET)"] = [f"{r} – {nt['checks'][i + 1]['Check (ET)'] if i + 1 < len(tbl) else (nt['next']['time'] if nt['next'] else '16:00')}"
+                                      for i, r in enumerate(tbl["Check (ET)"])]
+                tbl["Action"] = tbl["sig"].map({1: f"BUY {ticker}", -1: f"BUY {inverse}", 0: "FLAT"})
+                tbl = tbl.drop(columns=["sig"])
                 for col in ("Close", "Upper band", "Lower band", "VWAP"):
                     tbl[col] = tbl[col].map(lambda v: f"${v:.2f}")
-                st.dataframe(tbl, use_container_width=True, hide_index=True)
-        elif state_b2["holding"]:
-            st.caption("B2 holds shares, so the noise-band system is off.")
+                st.dataframe(tbl[["Window (ET)", "Action", "Close", "Upper band", "Lower band", "VWAP"]],
+                             use_container_width=True, hide_index=True)
+            if state_b2["holding"]:
+                st.caption("B2 holds shares, so these signals are informational only.")
         else:
             prof = pd.DataFrame({
-                "Check (ET)": [f"{(570 + m) // 60}:{(570 + m) % 60:02d}" for m in NOISE_CHECK_MINUTES],
+                "Check (ET)": [_hm(m) for m in NOISE_CHECK_MINUTES],
                 "Expected move from open": [f"{noise[m - 1] * 100:.2f}%" for m in NOISE_CHECK_MINUTES],
+                "Upper band if opens flat": [f"${session_state['latest_complete_close'] * (1 + noise[m - 1]):.2f}"
+                                             for m in NOISE_CHECK_MINUTES],
+                "Lower band if opens flat": [f"${session_state['latest_complete_close'] * (1 - noise[m - 1]):.2f}"
+                                             for m in NOISE_CHECK_MINUTES],
             })
-            st.caption(esc(
-                "Market not open. Bands will be max(open, prior close) × (1 + move) and "
-                "min(open, prior close) × (1 − move), combined with VWAP at each check. "
-                f"Prior close ${session_state['latest_complete_close']:.2f}."
-            ))
+            st.caption(esc("Market not open. Bands = max(open, prior close) × (1 + move) and "
+                           "min(open, prior close) × (1 − move), combined with VWAP at each check. "
+                           f"Prior close ${session_state['latest_complete_close']:.2f}."))
             st.dataframe(prof, use_container_width=True, hide_index=True)
         st.caption(f"Noise profile from {len(used)} sessions: "
                    f"{used[0] if used else '—'} to {used[-1] if used else '—'} · feed: {feed}.")
@@ -721,8 +822,15 @@ def render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_s
 # ============================================================================
 # UI
 # ============================================================================
-st.set_page_config(page_title="TQQQ B2 + D_rising_sma30", page_icon="📈", layout="wide")
-st.title("📈 TQQQ Daily Decision — B2 + Noise Bands and D_rising_sma30")
+st.set_page_config(page_title="B2 + Noise Bands + D_rising", page_icon="📈", layout="wide")
+st.title("📈 Daily Decision — B2 + Noise Bands and D_rising_sma30")
+pair_label = st.selectbox("Instrument pair (long / inverse)", list(TICKER_PAIRS), index=0)
+if TICKER_PAIRS[pair_label] is None:
+    _c1, _c2 = st.columns(2)
+    ticker = _c1.text_input("Long ticker", value=DEFAULT_TICKER).strip().upper()
+    inverse = _c2.text_input("Inverse ticker", value="SQQQ").strip().upper()
+else:
+    ticker, inverse = TICKER_PAIRS[pair_label]
 st.caption(
     "State machine runs only on confirmed closes. Live prices are preview only. "
     "Historical data: Yahoo Finance. Live price + clock: Alpaca."
@@ -731,7 +839,8 @@ st.caption(
 # --- Sidebar ---
 with st.sidebar:
     st.header("Settings")
-    ticker = st.text_input("Ticker", value=DEFAULT_TICKER).strip().upper()
+    replay_label = st.selectbox("B2 1-minute replay window (Alpaca)", list(B2_REPLAY_WINDOWS), index=1)
+    capital = st.number_input("Capital for share counts ($, optional)", min_value=0.0, value=0.0, step=500.0)
     period = st.selectbox("History lookback", ["5y", "10y", "max"], index=0)
     feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
     if st.button("🔄 Refresh data"):
@@ -883,7 +992,8 @@ pc3.metric(
 st.divider()
 
 # --- B2 + Standard Noise Bands (shown above the D-rising section) ---
-render_b2_section(ticker, period, feed, api_key, api_secret, snap, session_state)
+render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, session_state,
+                  replay_days=B2_REPLAY_WINDOWS[replay_label], capital=capital)
 
 # --- Confirmed strategy state ---
 st.header("🤖 Strategy state — based on confirmed closes")
@@ -949,7 +1059,7 @@ distance_to_trigger_pct = (trigger_price / close - 1) * 100
 narrative = []
 narrative.append(esc(
     f"At the {last_close_date.strftime('%a %b %d')} confirmed close of **${close:.2f}**, "
-    f"TQQQ is **{ext:+.2f}%** above its 200-day average of **${sma200:.2f}**."
+    f"{ticker} is **{ext:+.2f}%** above its 200-day average of **${sma200:.2f}**."
 ))
 
 if eff_locked:
@@ -986,7 +1096,7 @@ else:
         target = min(VOL_TARGET / rv20, 1.0)
         narrative.append(esc(
             f"**No lockout** — extension is {z_thresh - ext:.2f} percentage points below the z-threshold "
-            f"({z_thresh:+.2f}%). The lockout would fire if TQQQ closed at or above **${trigger_price:.2f}**."
+            f"({z_thresh:+.2f}%). The lockout would fire if {ticker} closed at or above **${trigger_price:.2f}**."
         ))
         narrative.append(esc(
             f"With RV20 at {rv20:.2f}%, target weight = min(50 / {rv20:.2f}, 1.0) = **{target*100:.1f}%**."
@@ -1055,7 +1165,7 @@ if SESSION == "OPEN" and preview_last is not None and preview_state is not None:
         # p_sma30 is sensitive to today's close too, but minimally — approximate threshold = p_sma30
         breakeven_price = p_sma30
         st.info(esc(
-            f"For the release to fire at today's close, TQQQ needs to close **above ~${breakeven_price:.2f}** "
+            f"For the release to fire at today's close, {ticker} needs to close **above ~${breakeven_price:.2f}** "
             f"(approximate, since SMA30 moves slightly with today's close). "
             f"Current live price: ${live_price:.2f} → {(live_price - breakeven_price):+.2f} from that level."
         ))
@@ -1132,7 +1242,7 @@ st.divider()
 st.header("💼 Your position")
 pc1, pc2 = st.columns(2)
 nlv = pc1.number_input("Account NLV ($)", min_value=0.0, value=52000.0, step=1000.0, format="%.2f")
-shares = pc2.number_input("Current TQQQ shares", min_value=0, value=0, step=1)
+shares = pc2.number_input(f"Current {ticker} shares", min_value=0, value=0, step=1)
 
 # --- Decision (based on confirmed state) ---
 new_locked, new_days, target, notes = make_decision(confirmed_last, locked=eff_locked, days_locked=eff_days)
