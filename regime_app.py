@@ -980,7 +980,8 @@ with st.sidebar:
     period = st.selectbox("History lookback", ["5y", "10y", "max"], index=0)
     feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
     fallback = st.checkbox("Bear-market fallback (index EMA50 < EMA200 → inverse B2 + noise bands)",
-                           value=False, help="Off = original B2 + noise bands, unchanged.")
+                           value=True, help="On by default: the app switches systems automatically from the "
+                           "index's EMA50/EMA200. Untick to see the original B2 + noise bands only.")
     if st.button("🔄 Refresh data"):
         st.cache_data.clear()
         st.rerun()
@@ -1464,7 +1465,7 @@ with st.expander("📝 State to record for tomorrow's journal"):
         "Target weight %": f"{action_weight*100:.1f}",
         "Shares after fill": target_shares,
     }])
-    st.dataframe(record.T.rename(columns={0: "value"}), use_container_width=True)
+    st.dataframe(record.T.rename(columns={0: "value"}).astype(str), use_container_width=True)
 
 st.caption(
     f"Strategy: D_rising_sma30. State machine input: confirmed closes only. "
