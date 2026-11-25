@@ -329,6 +329,10 @@ TICKER_PAIRS = {
     "SPXL / SPXS  (S&P 500, 3x)": ("SPXL", "SPXS"),
     "Other…": None,
 }
+# Bear-market fallback: index whose daily EMA50 < EMA200 (previous completed session)
+# authorizes the inverse ETF's own B2 + noise-band system while the long B2 is out.
+GATE_INDEX = {"TQQQ": "QQQ", "SPXL": "SPY"}
+GATE_FAST, GATE_SLOW = 50, 200
 
 
 # ============================================================================
@@ -422,6 +426,19 @@ def load_minute_bars(ticker, days, feed, api_key, api_secret, now_et_) -> pd.Dat
                                              now_et_.astimezone(utc).strftime(fmt), api_key, api_secret, "iex")
     out = pd.concat([hist, today], ignore_index=True) if len(today) else hist
     return out.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+
+def index_gate(index_ticker: str, last_complete_date: date) -> dict:
+    """Bear gate from the index's completed daily closes only (never today's partial bar)."""
+    df = fetch_yahoo_ohlc(index_ticker, "5y")
+    df = df[df["date"].dt.date <= last_complete_date]
+    if len(df) < GATE_SLOW:
+        raise RuntimeError(f"not enough {index_ticker} history for EMA{GATE_SLOW}")
+    c = df["close"]
+    e_fast = c.ewm(span=GATE_FAST, adjust=False).mean().iloc[-1]
+    e_slow = c.ewm(span=GATE_SLOW, adjust=False).mean().iloc[-1]
+    return {"ticker": index_ticker, "bearish": bool(e_fast < e_slow), "ema_fast": float(e_fast),
+            "ema_slow": float(e_slow), "date": df["date"].iloc[-1].date()}
 
 
 def bars_from_rows(rows) -> pd.DataFrame:
@@ -659,7 +676,7 @@ def render_action_card(color: str, action: str, detail: str, rows: list) -> None
 
 
 def render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, session_state,
-                      replay_days=365, capital=0.0):
+                      replay_days=365, capital=0.0, fallback=False):
     st.header(f"🧭 B2 + Standard Noise Bands — {ticker} / {inverse}")
     st.caption(
         "B2 = daily EMA10/20/50 regime with an adaptive trailing stop and intraday re-entry. "
@@ -722,6 +739,67 @@ def render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, 
     def shares(px):
         return f" — {int(capital // px):,} shares (${capital:,.0f})" if capital and px else ""
 
+    # --- Bear-market fallback (optional; long B2 always has priority) ---
+    fb = None
+    if fallback:
+        fb = {}
+        try:
+            fb["gate"] = index_gate(GATE_INDEX.get(ticker, "QQQ"), last_complete_date)
+        except Exception as e:
+            st.warning(f"Bear-market gate unavailable: {e}")
+        b2_out = not state_b2["holding"] and not state_b2.get("pending")
+        if fb.get("gate", {}).get("bearish") and b2_out:
+            try:
+                with st.spinner(f"Loading {inverse} data for the bear-market fallback..."):
+                    inv_snap_full = fetch_alpaca_snapshot(inverse, api_key, api_secret, feed=feed)
+                    inv_daily = build_b2_daily(fetch_yahoo_ohlc(inverse, period), inv_snap_full,
+                                               last_complete_date)
+                    inv_bars = load_minute_bars(inverse, replay_days, feed, api_key, api_secret, now_et_)
+                # Inverse B2 runs as its own continuously replayed (shadow) state machine.
+                fb["state"] = b2_replay(inv_daily, inv_bars, today_)
+                fb["reg"] = fb["state"]["next_regime"]
+                inv_noise, inv_used = noise_profile(
+                    inv_bars, today_ if SESSION_ == "OPEN" else today_ + timedelta(days=1))
+                inv_today = inv_bars[inv_bars["session"] == today_] if len(inv_bars) else inv_bars
+                fb["noise_ok"] = inv_noise is not None
+                fb["nt"] = (noise_today(inv_today, inv_noise, float(inv_daily["close"].iloc[-1]))
+                            if inv_noise is not None and SESSION_ == "OPEN" and len(inv_today) else None)
+            except Exception as e:
+                st.warning(f"{inverse} fallback data unavailable: {e}")
+                fb.pop("state", None)
+
+    def noise_card(nt_, band_t, long_t, short_t, long_px, short_px, tag=""):
+        """Action card for a noise-band system whose bands are computed on `band_t`."""
+        pos = nt_["position"] if nt_["checks"] else 0
+        last_chk = nt_["checks"][-1]["Check (ET)"] if nt_["checks"] else None
+        nx = nt_["next"]
+        window = f"{last_chk} – {nx['time'] if nx else '16:00'} ET" if last_chk else \
+            f"9:30 – {nx['time'] if nx else '10:00'} ET (before first check)"
+        if pos == 1:
+            color = GREEN if long_t == ticker else RED
+            action = f"BUY / HOLD {long_t}"
+            detail = f"{tag}Noise-band LONG {long_t} for {window}{shares(long_px)}. Sell by 4:00 PM."
+        elif pos == -1:
+            color = GREEN if short_t == ticker else RED
+            action = f"SELL SIGNAL → BUY {short_t}"
+            detail = f"{tag}Noise-band signal for {window}{shares(short_px)}. Sell {short_t} by 4:00 PM."
+        else:
+            color, action = GREY, f"FLAT — no {ticker}, no {inverse}"
+            detail = f"{tag}{band_t} is inside its bands for {window}."
+        if nt_["checks"]:
+            c0 = nt_["checks"][-1]
+            up, lo = c0["Upper band"], c0["Lower band"]
+            band_lbl = f"(set at {last_chk})"
+        else:
+            up, lo = (nx["upper"], nx["lower"]) if nx else (np.nan, np.nan)
+            band_lbl = f"(for {nx['time']})" if nx else ""
+        rows = [(f"{band_t} upper band {band_lbl}", f"${up:.2f}"), (f"{band_t} lower band {band_lbl}", f"${lo:.2f}"),
+                (f"{band_t} VWAP", f"${nt_['vwap']:.2f}"), (f"{band_t} last bar", f"${nt_['last_close']:.2f}")]
+        if nx:
+            rows += [(f"Next check {nx['time']} ET: BUY {long_t} if {band_t} above", f"${nx['long_above']:.2f}"),
+                     (f"Next check: BUY {short_t} if {band_t} below", f"${nx['short_below']:.2f}")]
+        render_action_card(color, action, detail, rows)
+
     # --- BIG ACTION CARD ---
     if state_b2["holding"]:
         thr = min(state_b2["peak"] * (1 - reg["trail"]), reg["rec"])
@@ -735,6 +813,33 @@ def render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, 
                            f"Buy at the next minute's open{shares(live_px)}. Close any {inverse} first.",
                            [(f"{reg['rec_name']}", f"${reg['rec']:.2f}"), (f"{ticker} live", f"${live_px:.2f}"),
                             ("New stop trail", f"{reg['trail'] * 100:.0f}%")])
+    elif fb is not None and fb.get("gate", {}).get("bearish") and fb.get("state"):
+        g, s2, r2 = fb["gate"], fb["state"], fb["reg"]
+        tag = f"Bear fallback ON ({g['ticker']} EMA50 < EMA200). "
+        if s2["holding"]:
+            thr2 = min(s2["peak"] * (1 - r2["trail"]), r2["rec"])
+            render_action_card(RED, f"HOLD / BUY {inverse} ({inverse} B2 IN)",
+                               tag + f"Hold {inverse} overnight; sell all if it trades at or below ${thr2:.2f}. "
+                               f"Sell at once if {ticker} B2 re-enters.",
+                               [(f"{inverse} exit stop", f"${thr2:.2f}"), ("Peak since entry", f"${s2['peak']:.2f}"),
+                                (f"Trail / {r2['rec_name']}", f"{r2['trail'] * 100:.0f}% / ${r2['rec']:.2f}"),
+                                (f"{inverse} live", f"${inv_px:.2f}" if inv_px else "—"),
+                                (f"{ticker} B2 re-entry above", f"${reg['rec']:.2f}")])
+        elif s2.get("pending"):
+            render_action_card(RED, f"BUY {inverse} — {inverse} B2 RE-ENTRY",
+                               tag + f"Buy at the next minute's open{shares(inv_px)}. Close any {ticker} noise trade first.",
+                               [(f"{inverse} {r2['rec_name']}", f"${r2['rec']:.2f}"),
+                                (f"{inverse} live", f"${inv_px:.2f}" if inv_px else "—"),
+                                ("New stop trail", f"{r2['trail'] * 100:.0f}%")])
+        elif fb.get("nt") is not None:
+            noise_card(fb["nt"], inverse, inverse, ticker, inv_px, live_px, tag)
+        else:
+            detail = tag + (f"{inverse} B2 is out. Market closed — {inverse} noise bands start with the 10:00 ET check."
+                            if fb.get("noise_ok") else f"{inverse} noise profile could not be built (try the SIP feed).")
+            render_action_card(GREY, "NO POSITION — WAIT", detail,
+                               [(f"{inverse} B2 re-entry above", f"${r2['rec']:.2f}"),
+                                (f"{ticker} B2 re-entry above", f"${reg['rec']:.2f}"),
+                                (f"{inverse} regime", r2["name"])])
     elif nt is None:
         if noise is None:
             detail = "B2 is out and the noise profile could not be built (try the SIP feed)."
@@ -745,35 +850,41 @@ def render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, 
                            [("B2 re-entry above", f"${reg['rec']:.2f}"), (f"{ticker} last", f"${live_px:.2f}"),
                             ("Regime", reg["name"])])
     else:
-        pos = nt["position"] if nt["checks"] else 0
-        last_chk = nt["checks"][-1]["Check (ET)"] if nt["checks"] else None
-        nx = nt["next"]
-        window = f"{last_chk} – {nx['time'] if nx else '16:00'} ET" if last_chk else \
-            f"9:30 – {nx['time'] if nx else '10:00'} ET (before first check)"
-        if pos == 1:
-            color, action = GREEN, f"BUY / HOLD {ticker}"
-            detail = f"Noise-band LONG for {window}{shares(live_px)}. Sell by 4:00 PM."
-        elif pos == -1:
-            color, action = RED, f"SELL SIGNAL → BUY {inverse}"
-            detail = f"Noise-band SHORT for {window}{shares(inv_px)}. Sell {inverse} by 4:00 PM."
-        else:
-            color, action = GREY, f"FLAT — no {ticker}, no {inverse}"
-            detail = f"Price is inside the bands for {window}."
-        if nt["checks"]:
-            c0 = nt["checks"][-1]
-            up, lo, vw = c0["Upper band"], c0["Lower band"], c0["VWAP"]
-            band_lbl = f"(set at {last_chk})"
-        else:
-            up, lo, vw = (nx["upper"], nx["lower"], nx["vwap"]) if nx else (np.nan, np.nan, nt["vwap"])
-            band_lbl = f"(for {nx['time']})" if nx else ""
-        rows = [(f"Upper band {band_lbl}", f"${up:.2f}"), (f"Lower band {band_lbl}", f"${lo:.2f}"),
-                ("VWAP", f"${nt['vwap']:.2f}"), (f"{ticker} last bar", f"${nt['last_close']:.2f}")]
-        if inv_px:
-            rows.append((f"{inverse} live", f"${inv_px:.2f}"))
-        if nx:
-            rows += [(f"Next check {nx['time']} ET: BUY {ticker} above", f"${nx['long_above']:.2f}"),
-                     (f"Next check: BUY {inverse} if {ticker} below", f"${nx['short_below']:.2f}")]
-        render_action_card(color, action, detail, rows)
+        noise_card(nt, ticker, ticker, inverse, live_px, inv_px)
+
+    # --- Leftover SQQQ B2 position: SQQQ held overnight must be sold once SQQQ B2 no longer controls ---
+    if fb is not None:
+        sqqq_b2_controls = (fb.get("gate", {}).get("bearish") and fb.get("state") is not None
+                            and (fb["state"]["holding"] or fb["state"].get("pending")))
+        if not sqqq_b2_controls:
+            why = (f"{ticker} B2 has priority" if state_b2["holding"] or state_b2.get("pending") else
+                   f"the {fb.get('gate', {}).get('ticker', 'index')} bear gate is OFF"
+                   if not fb.get("gate", {}).get("bearish") else f"{inverse} B2 has exited")
+            st.info(esc(f"Position origin check: if you are holding {inverse} OVERNIGHT from {inverse}_B2, "
+                        f"sell it now — {why}, so {inverse}_B2 no longer controls the account. "
+                        f"{inverse} bought by a noise-band signal today is unaffected: it follows the card above "
+                        f"and is sold by 4:00 PM."))
+
+    # --- Bear-market fallback status ---
+    if fb is not None:
+        st.subheader("Bear-market fallback")
+        g = fb.get("gate")
+        if g:
+            f1, f2, f3 = st.columns(3)
+            f1.metric(f"{g['ticker']} EMA50 / EMA200", f"{g['ema_fast']:.2f} / {g['ema_slow']:.2f}")
+            f2.metric("Gate", "ON — bearish" if g["bearish"] else "OFF", delta=f"as of {g['date']} close",
+                      delta_color="off")
+            f3.metric("Controlling system",
+                      f"{ticker} B2" if state_b2["holding"] or state_b2.get("pending") else
+                      (f"{inverse} B2" if fb.get("state", {}).get("holding") or fb.get("state", {}).get("pending")
+                       else f"{inverse} noise bands") if g["bearish"] else f"{ticker} noise bands")
+            if g["bearish"] and fb.get("state"):
+                s2, r2 = fb["state"], fb["reg"]
+                st.caption(esc(f"{inverse} B2 shadow state: {'IN' if s2['holding'] else 'OUT'} · regime {r2['name']} · "
+                               f"trail {r2['trail'] * 100:.0f}% · {r2['rec_name']} ${r2['rec']:.2f}. "
+                               f"Replayed from the same window as {ticker} B2 (daily approximation before the 1-minute window)."))
+            elif g["bearish"]:
+                st.caption(f"Not evaluated while {ticker} B2 is in or re-entering: it has priority.")
 
     # --- B2 detail ---
     rc1, rc2, rc3, rc4 = st.columns(4)
@@ -868,6 +979,8 @@ with st.sidebar:
     capital = st.number_input("Capital for share counts ($, optional)", min_value=0.0, value=0.0, step=500.0)
     period = st.selectbox("History lookback", ["5y", "10y", "max"], index=0)
     feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
+    fallback = st.checkbox("Bear-market fallback (index EMA50 < EMA200 → inverse B2 + noise bands)",
+                           value=False, help="Off = original B2 + noise bands, unchanged.")
     if st.button("🔄 Refresh data"):
         st.cache_data.clear()
         st.rerun()
@@ -1018,7 +1131,7 @@ st.divider()
 
 # --- B2 + Standard Noise Bands (shown above the D-rising section) ---
 render_b2_section(ticker, inverse, period, feed, api_key, api_secret, snap, session_state,
-                  replay_days=B2_REPLAY_WINDOWS[replay_label], capital=capital)
+                  replay_days=B2_REPLAY_WINDOWS[replay_label], capital=capital, fallback=fallback)
 
 # --- Confirmed strategy state ---
 st.header("🤖 Strategy state — based on confirmed closes")
